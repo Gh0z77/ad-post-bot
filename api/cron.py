@@ -1,0 +1,53 @@
+"""Vercel Cron: GET /api/cron — har daqiqada chaqiriladi, vaqti kelgan broadcastlarni yuboradi."""
+import os
+import sys
+from http.server import BaseHTTPRequestHandler
+from datetime import datetime, timedelta
+
+sys.path.append(os.path.dirname(__file__))
+import _store as S
+import _tg as T
+
+
+class handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            S.init_db()
+            con = S.db(); cur = con.cursor()
+            cur.execute("SELECT * FROM broadcasts WHERE is_active=1 AND source_msg_id IS NOT NULL")
+            rows = cur.fetchall()
+            con.close()
+            sent = 0
+            now = datetime.now()
+            for bc in rows:
+                iv = bc["interval_min"] or 10
+                last = bc["last_sent"]
+                due = True
+                if last:
+                    try:
+                        due = now - datetime.fromisoformat(last) >= timedelta(minutes=iv)
+                    except Exception:
+                        due = True
+                if not due:
+                    continue
+                uid = bc["user_id"]
+                con2 = S.db(); cur2 = con2.cursor()
+                cur2.execute("""SELECT g.chat_id FROM user_groups ug JOIN groups g ON g.chat_id=ug.group_id
+                                WHERE ug.user_id=?""", (uid,))
+                groups = cur2.fetchall()
+                con2.close()
+                for g in groups:
+                    T.copy_message(g["chat_id"], bc["source_chat_id"], bc["source_msg_id"])
+                con3 = S.db(); cur3 = con3.cursor()
+                cur3.execute("UPDATE broadcasts SET last_sent=? WHERE user_id=?",
+                             (now.isoformat(timespec="seconds"), uid))
+                con3.commit(); con3.close()
+                sent += 1
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(f'{{"ok":true,"sent":{sent}}}'.encode())
+        except Exception as e:
+            print("cron xato:", e)
+            self.send_response(500)
+            self.end_headers()
