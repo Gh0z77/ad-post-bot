@@ -9,6 +9,9 @@ ExecStart=/usr/bin/python3 /root/bot/bot.py
 Restart=always
 RestartSec=5
 Environment=BOT_TOKEN=YOUR_TOKEN_HERE
+Environment=FOUNDER_USERNAME=dior_coder
+#Environment=ADMIN_IDS=123456789
+#Environment=DATABASE_URL=postgresql://user:pass@host:5432/dbname
 
 [Install]
 WantedBy=multi-user.target

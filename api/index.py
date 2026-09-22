@@ -2,6 +2,7 @@
 import os
 import sys
 import json
+import time
 from http.server import BaseHTTPRequestHandler
 from datetime import datetime
 
@@ -11,42 +12,49 @@ import _tg as T
 
 
 def is_founder(tg_user):
-    if tg_user and (tg_user.get("username") or "").lower() == S.FOUNDER_USERNAME.lower():
+    if not tg_user:
+        return False
+    if tg_user.get("id") in S.ADMIN_IDS:
         return True
-    if tg_user:
-        con = S.db(); cur = con.cursor()
-        cur.execute("SELECT is_founder FROM users WHERE user_id=?", (tg_user["id"],))
-        r = cur.fetchone(); con.close()
-        if r and r["is_founder"]:
-            return True
+    if (tg_user.get("username") or "").lower() == S.FOUNDER_USERNAME.lower():
+        return True
+    con = S.db(); cur = con.cursor()
+    S._ex(cur, "SELECT is_founder FROM users WHERE user_id=?", (tg_user["id"],))
+    r = cur.fetchone(); con.close()
+    if r and r["is_founder"]:
+        return True
     return False
+
+
+def is_banned(uid):
+    con = S.db(); cur = con.cursor()
+    S._ex(cur, "SELECT is_banned FROM users WHERE user_id=?", (uid,))
+    r = cur.fetchone(); con.close()
+    return bool(r and r["is_banned"])
 
 
 def ensure_user(tu, founder=False):
     con = S.db(); cur = con.cursor()
     now = datetime.now().isoformat(timespec="seconds")
-    cur.execute("SELECT * FROM users WHERE user_id=?", (tu["id"],))
+    S._ex(cur, "SELECT * FROM users WHERE user_id=?", (tu["id"],))
     ex = cur.fetchone()
     if ex:
-        cur.execute("UPDATE users SET username=?, first_name=?, is_founder=? WHERE user_id=?",
-                    (tu.get("username") or "", tu.get("first_name") or "",
-                     1 if (founder or ex["is_founder"]) else 0, tu["id"]))
+        S._ex(cur, "UPDATE users SET username=?, first_name=?, is_founder=? WHERE user_id=?",
+              (tu.get("username") or "", tu.get("first_name") or "",
+               1 if (founder or ex["is_founder"]) else 0, tu["id"]))
     else:
-        cur.execute("INSERT INTO users(user_id,username,first_name,is_founder,created) VALUES(?,?,?,?,?)",
-                    (tu["id"], tu.get("username") or "", tu.get("first_name") or "",
-                     1 if founder else 0, now))
-        cur.execute("SELECT chat_id FROM groups")
-        for g in cur.fetchall():
-            cur.execute("INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?,?)",
-                        (tu["id"], g["chat_id"]))
+        S._ex(cur, "INSERT INTO users(user_id,username,first_name,is_founder,created) VALUES(?,?,?,?,?)",
+              (tu["id"], tu.get("username") or "", tu.get("first_name") or "",
+               1 if founder else 0, now))
+        # XAVFSIZLIK: begona guruhlarni auto-biriktirmaymiz
     con.commit(); con.close()
 
 
 def do_broadcast(uid):
     con = S.db(); cur = con.cursor()
-    cur.execute("SELECT * FROM broadcasts WHERE user_id=?", (uid,))
+    S._ex(cur, "SELECT * FROM broadcasts WHERE user_id=?", (uid,))
     bc = cur.fetchone()
-    cur.execute("""SELECT g.chat_id FROM user_groups ug JOIN groups g ON g.chat_id=ug.group_id
+    S._ex(cur, """SELECT g.chat_id FROM user_groups ug JOIN groups g ON g.chat_id=ug.group_id
                    WHERE ug.user_id=?""", (uid,))
     groups = cur.fetchall()
     con.close()
@@ -59,11 +67,30 @@ def do_broadcast(uid):
             ok += 1
         else:
             fail += 1
+            desc = str(r).lower()
+            if "not found" in desc or "deleted" in desc or "kicked" in desc:
+                try:
+                    con2 = S.db(); cur2 = con2.cursor()
+                    S._ex(cur2, "DELETE FROM groups WHERE chat_id=?", (g["chat_id"],))
+                    S._ex(cur2, "DELETE FROM user_groups WHERE group_id=?", (g["chat_id"],))
+                    con2.commit(); con2.close()
+                except Exception:
+                    pass
+        time.sleep(0.1)
     con = S.db(); cur = con.cursor()
-    cur.execute("UPDATE broadcasts SET last_sent=? WHERE user_id=?",
-                (datetime.now().isoformat(timespec="seconds"), uid))
+    S._ex(cur, "UPDATE broadcasts SET last_sent=? WHERE user_id=?",
+          (datetime.now().isoformat(timespec="seconds"), uid))
     con.commit(); con.close()
     return ok, fail
+
+
+def founder_stats_text():
+    con = S.db(); cur = con.cursor()
+    cur.execute("SELECT COUNT(*) c FROM users"); uc = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) c FROM groups"); gc = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) c FROM broadcasts WHERE is_active=1"); ac = cur.fetchone()["c"]
+    con.close()
+    return f"📊 <b>Statistika</b>\n👥 Userlar: {uc}\n📋 Guruhlar: {gc}\n🟢 Faol broadcast: {ac}"
 
 
 def handle(update):
@@ -75,17 +102,19 @@ def handle(update):
         st = m["new_chat_member"]["status"]
         if chat["type"] in ("group", "supergroup", "channel"):
             con = S.db(); cur = con.cursor()
+            now = datetime.now().isoformat(timespec="seconds")
             if st in ("member", "administrator"):
-                cur.execute("INSERT OR REPLACE INTO groups(chat_id,title,gtype,added_at) VALUES(?,?,?,?)",
-                            (chat["id"], chat.get("title") or str(chat["id"]), chat["type"],
-                             datetime.now().isoformat(timespec="seconds")))
-                cur.execute("SELECT user_id FROM users WHERE is_banned=0")
-                for u in cur.fetchall():
-                    cur.execute("INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?,?)",
-                                (u["user_id"], chat["id"]))
+                S.upsert_group(cur, chat["id"], chat.get("title") or str(chat["id"]), chat["type"], now)
+                owner = (m.get("from") or {})
+                owner_id = owner.get("id")
+                if owner_id and not owner.get("is_bot"):
+                    try:
+                        S.link_user_group(cur, owner_id, chat["id"])
+                    except Exception:
+                        pass
             else:
-                cur.execute("DELETE FROM groups WHERE chat_id=?", (chat["id"],))
-                cur.execute("DELETE FROM user_groups WHERE group_id=?", (chat["id"],))
+                S._ex(cur, "DELETE FROM groups WHERE chat_id=?", (chat["id"],))
+                S._ex(cur, "DELETE FROM user_groups WHERE group_id=?", (chat["id"],))
             con.commit(); con.close()
         return
 
@@ -94,32 +123,112 @@ def handle(update):
         q = update["callback_query"]
         uid = q["from"]["id"]
         data = q.get("data", "")
+        msg_id = q["message"]["message_id"]
         T.api_call("answerCallbackQuery", {"callback_query_id": q["id"]})
-        if data == "f:stats":
+        founder = is_founder(q["from"])
+
+        if data.startswith("t:"):
+            try:
+                gid = int(data[2:])
+            except ValueError:
+                return
             con = S.db(); cur = con.cursor()
-            cur.execute("SELECT COUNT(*) c FROM users"); uc = cur.fetchone()["c"]
-            cur.execute("SELECT COUNT(*) c FROM groups"); gc = cur.fetchone()["c"]
-            cur.execute("SELECT COUNT(*) c FROM broadcasts WHERE is_active=1"); ac = cur.fetchone()["c"]
+            S._ex(cur, "SELECT * FROM user_groups WHERE user_id=? AND group_id=?", (uid, gid))
+            if cur.fetchone():
+                S._ex(cur, "DELETE FROM user_groups WHERE user_id=? AND group_id=?", (uid, gid))
+                txt = f"o'chirildi ❌ ({gid})"
+            else:
+                S.link_user_group(cur, uid, gid)
+                txt = f"qo'shildi ✅ ({gid})"
+            con.commit(); con.close()
+            T.api_call("editMessageText", {"chat_id": uid, "message_id": msg_id, "text": txt})
+            return
+        if data == "a:all":
+            con = S.db(); cur = con.cursor()
+            cur.execute("SELECT chat_id FROM groups")
+            n = 0
+            for g in cur.fetchall():
+                S.link_user_group(cur, uid, g["chat_id"])
+                n += 1
+            con.commit(); con.close()
+            T.api_call("editMessageText", {"chat_id": uid, "message_id": msg_id,
+                                           "text": f"✅ Hamma guruhlar tanlandi ({n} ta)."})
+            return
+        if data == "a:none":
+            con = S.db(); cur = con.cursor()
+            S._ex(cur, "DELETE FROM user_groups WHERE user_id=?", (uid,))
+            con.commit(); con.close()
+            T.api_call("editMessageText", {"chat_id": uid, "message_id": msg_id, "text": "🧹 Tanlov tozalandi."})
+            return
+        if data == "m:main":
+            T.api_call("editMessageText", {"chat_id": uid, "message_id": msg_id,
+                                           "text": "👑 Founder panel yopildi. Menyudan foydalaning."})
+            return
+        if data == "f:back":
+            T.api_call("editMessageText", {"chat_id": uid, "message_id": msg_id,
+                                           "text": "👑 <b>Founder panel</b>:", "parse_mode": "HTML",
+                                           "reply_markup": T.founder_inline()})
+            return
+
+        if not founder:
+            T.api_call("editMessageText", {"chat_id": uid, "message_id": msg_id, "text": "⛔ Faqat founder uchun."})
+            return
+        if data == "f:stats":
+            T.api_call("editMessageText", {"chat_id": uid, "message_id": msg_id,
+                "text": founder_stats_text(), "parse_mode": "HTML", "reply_markup": T.founder_inline()})
+        elif data == "f:groups":
+            con = S.db(); cur = con.cursor()
+            cur.execute("SELECT * FROM groups ORDER BY added_at DESC LIMIT 30")
+            groups = cur.fetchall(); con.close()
+            if not groups:
+                txt = "📭 Guruhlar yo'q."
+            else:
+                txt = "📋 <b>Barcha guruhlar:</b>\n" + "\n".join(
+                    f"• {g['title']} (<code>{g['chat_id']}</code>)" for g in groups)
+            T.api_call("editMessageText", {"chat_id": uid, "message_id": msg_id,
+                "text": txt, "parse_mode": "HTML", "reply_markup": T.founder_inline()})
+        elif data == "f:users":
+            con = S.db(); cur = con.cursor()
+            cur.execute("SELECT * FROM users ORDER BY created DESC LIMIT 20")
+            rows = cur.fetchall(); con.close()
+            if not rows:
+                T.api_call("editMessageText", {"chat_id": uid, "message_id": msg_id, "text": "👥 Userlar yo'q.",
+                                               "reply_markup": T.founder_inline()})
+            else:
+                kb = []
+                for r in rows:
+                    nm = f"@{r['username']}" if r["username"] else (r["first_name"] or str(r["user_id"]))
+                    mark = "🚫" if r["is_banned"] else "✅"
+                    kb.append([{"text": f"{mark} {nm}", "callback_data": f"b:{r['user_id']}"}])
+                kb.append([{"text": "◀️ Orqaga", "callback_data": "f:back"}])
+                T.api_call("editMessageText", {"chat_id": uid, "message_id": msg_id,
+                    "text": "👥 <b>So'nggi 20 user</b> (banni bosish uchun):", "parse_mode": "HTML",
+                    "reply_markup": {"inline_keyboard": kb}})
+        elif data.startswith("b:"):
+            try:
+                target = int(data[2:])
+            except ValueError:
+                return
+            con = S.db(); cur = con.cursor()
+            S._ex(cur, "SELECT * FROM users WHERE user_id=?", (target,))
+            r = cur.fetchone()
+            if r:
+                new_ban = 0 if r["is_banned"] else 1
+                S._ex(cur, "UPDATE users SET is_banned=? WHERE user_id=?", (new_ban, target))
+                con.commit()
+                T.api_call("editMessageText", {"chat_id": uid, "message_id": msg_id,
+                    "text": f"{'🚫 Ban qilindi' if new_ban else '✅ Ban olindi'}: {target}",
+                    "reply_markup": T.founder_inline()})
             con.close()
-            T.api_call("editMessageText", {"chat_id": uid, "message_id": q["message"]["message_id"],
-                "text": f"📊 Userlar: {uc} | Guruhlar: {gc} | Faol: {ac}", "reply_markup": T.founder_inline()})
+        elif data == "f:announce":
+            S.set_state(uid, "wait_announce")
+            T.api_call("editMessageText", {"chat_id": uid, "message_id": msg_id,
+                "text": "📢 Announce matnini yuboring (hamma userga boradi)."})
         elif data == "f:stopall":
             con = S.db(); cur = con.cursor()
             cur.execute("UPDATE broadcasts SET is_active=0"); con.commit(); con.close()
-            T.api_call("editMessageText", {"chat_id": uid, "message_id": q["message"]["message_id"],
+            T.api_call("editMessageText", {"chat_id": uid, "message_id": msg_id,
                 "text": "⛔ Hamma broadcast to'xtatildi.", "reply_markup": T.founder_inline()})
-        elif data.startswith("t:"):
-            gid = int(data[2:])
-            con = S.db(); cur = con.cursor()
-            cur.execute("SELECT * FROM user_groups WHERE user_id=? AND group_id=?", (uid, gid))
-            if cur.fetchone():
-                cur.execute("DELETE FROM user_groups WHERE user_id=? AND group_id=?", (uid, gid))
-                txt = f"o'chirildi ❌ ({gid})"
-            else:
-                cur.execute("INSERT INTO user_groups(user_id,group_id) VALUES(?,?)", (uid, gid))
-                txt = f"qo'shildi ✅ ({gid})"
-            con.commit(); con.close()
-            T.api_call("editMessageText", {"chat_id": uid, "message_id": q["message"]["message_id"], "text": txt})
         return
 
     if "message" not in update:
@@ -128,12 +237,11 @@ def handle(update):
     chat = msg["chat"]
     tu = msg.get("from", {})
 
-    # guruhdagi xabar — nomni yangilash
+    # guruhdagi xabar — faqat nomni yangilash
     if chat["type"] in ("group", "supergroup", "channel"):
         con = S.db(); cur = con.cursor()
-        cur.execute("INSERT OR REPLACE INTO groups(chat_id,title,gtype,added_at) VALUES(?,?,?,?)",
-                    (chat["id"], chat.get("title") or str(chat["id"]), chat["type"],
-                     datetime.now().isoformat(timespec="seconds")))
+        S.upsert_group(cur, chat["id"], chat.get("title") or str(chat["id"]), chat["type"],
+                       datetime.now().isoformat(timespec="seconds"))
         con.commit(); con.close()
         if msg.get("text", "").startswith("/start"):
             T.send_message(chat["id"], "👋 Salom! Sozlash uchun lichkamga yozing.")
@@ -143,19 +251,36 @@ def handle(update):
     uid = tu["id"]
     founder = is_founder(tu)
     ensure_user(tu, founder)
+    if is_banned(uid) and not founder:
+        T.send_message(uid, "⛔ Siz bloklangansiz.")
+        return
     text = (msg.get("text") or "").strip()
     state = S.get_state(uid)
+
+    if state == "wait_announce" and founder and text:
+        S.set_state(uid, None)
+        con = S.db(); cur = con.cursor()
+        cur.execute("SELECT user_id FROM users WHERE is_banned=0")
+        users = [r["user_id"] for r in cur.fetchall()]; con.close()
+        ok = 0
+        for u in users:
+            r = T.send_message(u, f"📢 <b>Founder xabari:</b>\n\n{text}")
+            if r.get("ok"):
+                ok += 1
+            time.sleep(0.05)
+        T.send_message(uid, f"✅ Announce {ok} userga yuborildi.", reply_markup=T.main_menu(founder))
+        return
 
     if state == "wait_interval" and text:
         try:
             mins = int(text.split()[0])
             assert 1 <= mins <= 10080
             con = S.db(); cur = con.cursor()
-            cur.execute("SELECT * FROM broadcasts WHERE user_id=?", (uid,))
+            S._ex(cur, "SELECT * FROM broadcasts WHERE user_id=?", (uid,))
             if cur.fetchone():
-                cur.execute("UPDATE broadcasts SET interval_min=? WHERE user_id=?", (mins, uid))
+                S._ex(cur, "UPDATE broadcasts SET interval_min=? WHERE user_id=?", (mins, uid))
             else:
-                cur.execute("INSERT INTO broadcasts(user_id,interval_min,is_active) VALUES(?,?,0)", (uid, mins))
+                S._ex(cur, "INSERT INTO broadcasts(user_id,interval_min,is_active) VALUES(?,?,0)", (uid, mins))
             con.commit(); con.close()
             S.set_state(uid, None)
             T.send_message(uid, f"✅ Interval: har <b>{mins} daqiqada</b>. ▶️ Start ni bosing.",
@@ -167,12 +292,12 @@ def handle(update):
     if state == "wait_message" and (text or msg.get("photo") or msg.get("video") or msg.get("document")):
         preview = (text or msg.get("caption") or "[media]")[:200]
         con = S.db(); cur = con.cursor()
-        cur.execute("SELECT * FROM broadcasts WHERE user_id=?", (uid,))
+        S._ex(cur, "SELECT * FROM broadcasts WHERE user_id=?", (uid,))
         if cur.fetchone():
-            cur.execute("""UPDATE broadcasts SET source_chat_id=?, source_msg_id=?, preview=?
+            S._ex(cur, """UPDATE broadcasts SET source_chat_id=?, source_msg_id=?, preview=?
                            WHERE user_id=?""", (chat["id"], msg["message_id"], preview, uid))
         else:
-            cur.execute("""INSERT INTO broadcasts(user_id,source_chat_id,source_msg_id,preview,interval_min,is_active)
+            S._ex(cur, """INSERT INTO broadcasts(user_id,source_chat_id,source_msg_id,preview,interval_min,is_active)
                            VALUES(?,?,?,?,10,0)""", (uid, chat["id"], msg["message_id"], preview))
         con.commit(); con.close()
         S.set_state(uid, None)
@@ -184,29 +309,33 @@ def handle(update):
         T.send_message(uid,
             f"Assalomu alaykum, {tu.get('first_name','')}!\n"
             f"{'👑 <b>Founder</b>' if founder else '👤 Foydalanuvchi'} sifatida kirdingiz.\n\n"
-            "1️⃣ Meni guruhga qo'shing (admin).\n2️⃣ 📝 Xabar yaratish\n3️⃣ ⏱ Interval\n4️⃣ ▶️ Start",
+            "1️⃣ Meni guruhga qo'shing (admin).\n2️⃣ 📝 Xabar yaratish\n3️⃣ ⏱ Interval\n4️⃣ 📋 Guruhlarim → tanlash\n5️⃣ ▶️ Start",
             reply_markup=T.main_menu(founder))
     elif text == "📝 Xabar yaratish":
         S.set_state(uid, "wait_message")
-        T.send_message(uid, "✍️ Yuboriladigan xabarni shu yerga tashlang.")
+        T.send_message(uid, "✍️ Yuboriladigan xabarni shu yerga tashlang.\nMatn, foto, video, dokument — hammasini qabul qilaman.")
     elif text == "⏱ Interval":
         S.set_state(uid, "wait_interval")
-        T.send_message(uid, "Daqiqada yuboring (masalan: 10). Min 1.")
+        con = S.db(); cur = con.cursor()
+        S._ex(cur, "SELECT interval_min FROM broadcasts WHERE user_id=?", (uid,))
+        r = cur.fetchone(); con.close()
+        cur_iv = r["interval_min"] if r else 10
+        T.send_message(uid, f"Hozirgi: <b>{cur_iv} daqiqa</b>.\nYangi intervalni daqiqada yuboring (masalan: 5, 10, 30):")
     elif text == "▶️ Start":
         con = S.db(); cur = con.cursor()
-        cur.execute("SELECT * FROM broadcasts WHERE user_id=?", (uid,))
+        S._ex(cur, "SELECT * FROM broadcasts WHERE user_id=?", (uid,))
         bc = cur.fetchone()
         if not bc or not bc["source_msg_id"]:
             T.send_message(uid, "❌ Avval 📝 Xabar yaratish.")
         else:
-            cur.execute("UPDATE broadcasts SET is_active=1, last_sent=? WHERE user_id=?",
-                        (datetime.now().isoformat(timespec="seconds"), uid))
+            S._ex(cur, "UPDATE broadcasts SET is_active=1, last_sent=? WHERE user_id=?",
+                  (datetime.now().isoformat(timespec="seconds"), uid))
             T.send_message(uid, f"▶️ Boshladim! Har {bc['interval_min']} daqiqada yuboraman (Vercel cron orqali).",
                            reply_markup=T.main_menu(founder))
         con.commit(); con.close()
     elif text == "⏸ Stop":
         con = S.db(); cur = con.cursor()
-        cur.execute("UPDATE broadcasts SET is_active=0 WHERE user_id=?", (uid,))
+        S._ex(cur, "UPDATE broadcasts SET is_active=0 WHERE user_id=?", (uid,))
         con.commit(); con.close()
         T.send_message(uid, "⏸ To'xtatildi.", reply_markup=T.main_menu(founder))
     elif text == "🚀 Test yuborish":
@@ -214,9 +343,9 @@ def handle(update):
         T.send_message(uid, f"🚀 Test: ✅ {ok} | ❌ {fail}")
     elif text == "📊 Status":
         con = S.db(); cur = con.cursor()
-        cur.execute("SELECT * FROM broadcasts WHERE user_id=?", (uid,))
+        S._ex(cur, "SELECT * FROM broadcasts WHERE user_id=?", (uid,))
         bc = cur.fetchone()
-        cur.execute("SELECT COUNT(*) c FROM user_groups WHERE user_id=?", (uid,))
+        S._ex(cur, "SELECT COUNT(*) c FROM user_groups WHERE user_id=?", (uid,))
         gc = cur.fetchone()["c"]
         con.close()
         if not bc or not bc["source_msg_id"]:
@@ -226,15 +355,17 @@ def handle(update):
                            reply_markup=T.main_menu(founder))
     elif text == "📋 Guruhlarim":
         con = S.db(); cur = con.cursor()
-        cur.execute("SELECT * FROM groups LIMIT 30"); groups = cur.fetchall()
-        cur.execute("SELECT group_id FROM user_groups WHERE user_id=?", (uid,))
+        cur.execute("SELECT * FROM groups ORDER BY added_at DESC LIMIT 30"); groups = cur.fetchall()
+        S._ex(cur, "SELECT group_id FROM user_groups WHERE user_id=?", (uid,))
         my = {r["group_id"] for r in cur.fetchall()}
         con.close()
         if not groups:
-            T.send_message(uid, "📭 Guruh yo'q. Botni guruhga qo'shing.")
+            T.send_message(uid, "📭 Guruh yo'q. Botni guruhga qo'shing (o'zingiz qo'shganingiz sizga biriktiriladi).")
         else:
             kb = [[{"text": f"{'✅' if g['chat_id'] in my else '❌'} {(g['title'] or '')[:25]}",
                     "callback_data": f"t:{g['chat_id']}"}] for g in groups]
+            kb.append([{"text": "✅ Hammasini tanlash", "callback_data": "a:all"},
+                       {"text": "🧹 Tozalash", "callback_data": "a:none"}])
             T.send_message(uid, f"📋 Guruhlar ({len(groups)}):", reply_markup={"inline_keyboard": kb})
     elif text == "👑 Founder panel":
         if founder:
@@ -242,18 +373,17 @@ def handle(update):
         else:
             T.send_message(uid, "⛔ Faqat founder.")
     elif text == "❓ Yordam":
-        T.send_message(uid, "Botni guruhga admin qiling → 📝 Xabar → ⏱ Interval → ▶️ Start.\nVercel'da yuborish har daqiqalik cron orqali ishlaydi.")
+        T.send_message(uid, "Botni guruhga admin qiling → 📝 Xabar → ⏱ Interval → 📋 Guruhlarim → ▶️ Start.\nVercel'da yuborish har daqiqalik cron orqali ishlaydi.")
     elif text and not text.startswith("/"):
-        # to'g'ridan media/matn tashlansa xabar sifatida saqlash
         if msg.get("photo") or msg.get("video") or msg.get("document") or len(text) > 1:
             preview = (text or msg.get("caption") or "[media]")[:200]
             con = S.db(); cur = con.cursor()
-            cur.execute("SELECT * FROM broadcasts WHERE user_id=?", (uid,))
+            S._ex(cur, "SELECT * FROM broadcasts WHERE user_id=?", (uid,))
             if cur.fetchone():
-                cur.execute("UPDATE broadcasts SET source_chat_id=?, source_msg_id=?, preview=? WHERE user_id=?",
-                            (chat["id"], msg["message_id"], preview, uid))
+                S._ex(cur, "UPDATE broadcasts SET source_chat_id=?, source_msg_id=?, preview=? WHERE user_id=?",
+                      (chat["id"], msg["message_id"], preview, uid))
             else:
-                cur.execute("""INSERT INTO broadcasts(user_id,source_chat_id,source_msg_id,preview,interval_min,is_active)
+                S._ex(cur, """INSERT INTO broadcasts(user_id,source_chat_id,source_msg_id,preview,interval_min,is_active)
                                VALUES(?,?,?,?,10,0)""", (uid, chat["id"], msg["message_id"], preview))
             con.commit(); con.close()
             T.send_message(uid, "✅ Xabar saqlandi!", reply_markup=T.main_menu(founder))

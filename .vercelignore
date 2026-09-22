@@ -1,0 +1,14 @@
+bot.db
+bot.py
+__pycache__/
+*.pyc
+*.log
+.env
+venv/
+.git/
+.kilo/
+bot.service
+run.bat
+Dockerfile
+render.yaml
+Procfile

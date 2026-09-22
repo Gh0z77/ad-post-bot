@@ -13,6 +13,12 @@ import sqlite3
 import asyncio
 from datetime import datetime
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton,
@@ -21,14 +27,31 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ChatMemberHandler, ContextTypes, filters,
 )
-from telegram.error import Forbidden, BadRequest
+from telegram.error import Forbidden, BadRequest, RetryAfter
 
 # ============ CONFIG ============
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN topilmadi! Render/Railway Environment ga qo'shing yoki .env yarating.")
-FOUNDER_USERNAME = "dior_coder"  # @ siz yoziladi
+FOUNDER_USERNAME = os.getenv("FOUNDER_USERNAME", "dior_coder")  # @ siz yoziladi
+_raw_admins = os.getenv("ADMIN_IDS", "") or os.getenv("FOUNDER_IDS", "")
+ADMIN_IDS = {int(x.strip()) for x in _raw_admins.split(",") if x.strip().lstrip("-").isdigit()}
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+USE_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+if DATABASE_URL.startswith("postgres://"):
+    # psycopg2 eski sxemani tushunmaydi
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
+
+_pg_mods = {}
+if USE_PG:
+    try:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        _pg_mods["psycopg2"] = psycopg2
+        _pg_mods["RealDictCursor"] = RealDictCursor
+    except ImportError:
+        raise RuntimeError("DATABASE_URL berilgan, lekin psycopg2 o'rnatilmagan! requirements.txt ga qarang.")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -38,68 +61,91 @@ logger = logging.getLogger(__name__)
 
 # ============ DB ============
 def db():
+    if USE_PG:
+        con = _pg_mods["psycopg2"].connect(DATABASE_URL, cursor_factory=_pg_mods["RealDictCursor"])
+        return con
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     return con
 
+def _ex(cur, query, params=()):
+    """sqlite (?) va postgres (%s) placeholder farqini yashiradi."""
+    if USE_PG:
+        cur.execute(query.replace("?", "%s"), params)
+    else:
+        cur.execute(query, params)
+
 def init_db():
     con = db()
     cur = con.cursor()
+    # BIGINT ikkala DB da ham ishlaydi
     cur.execute("""CREATE TABLE IF NOT EXISTS users(
-        user_id INTEGER PRIMARY KEY,
+        user_id BIGINT PRIMARY KEY,
         username TEXT, first_name TEXT,
         is_founder INTEGER DEFAULT 0,
         is_banned INTEGER DEFAULT 0,
         created TEXT
     )""")
     cur.execute("""CREATE TABLE IF NOT EXISTS groups(
-        chat_id INTEGER PRIMARY KEY,
+        chat_id BIGINT PRIMARY KEY,
         title TEXT, gtype TEXT,
         added_at TEXT
     )""")
     cur.execute("""CREATE TABLE IF NOT EXISTS user_groups(
-        user_id INTEGER, group_id INTEGER,
+        user_id BIGINT, group_id BIGINT,
         PRIMARY KEY(user_id, group_id)
     )""")
     cur.execute("""CREATE TABLE IF NOT EXISTS broadcasts(
-        user_id INTEGER PRIMARY KEY,
-        source_chat_id INTEGER,
-        source_msg_id INTEGER,
+        user_id BIGINT PRIMARY KEY,
+        source_chat_id BIGINT,
+        source_msg_id BIGINT,
         has_text INTEGER DEFAULT 0,
         preview TEXT,
         interval_min INTEGER DEFAULT 10,
-        is_active INTEGER DEFAULT 0
+        is_active INTEGER DEFAULT 0,
+        last_sent TEXT
     )""")
+    # eski DB larda last_sent bo'lmasligi mumkin -> qo'shib qo'yamiz
+    try:
+        if USE_PG:
+            cur.execute("ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS last_sent TEXT")
+            cur.execute("ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS has_text INTEGER DEFAULT 0")
+        else:
+            cur.execute("PRAGMA table_info(broadcasts)")
+            cols = {r[1] for r in cur.fetchall()}
+            if "last_sent" not in cols:
+                cur.execute("ALTER TABLE broadcasts ADD COLUMN last_sent TEXT")
+            if "has_text" not in cols:
+                cur.execute("ALTER TABLE broadcasts ADD COLUMN has_text INTEGER DEFAULT 0")
+    except Exception:
+        pass
     con.commit()
     con.close()
 
 def get_user(user_id):
     con = db(); cur = con.cursor()
-    cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    _ex(cur, "SELECT * FROM users WHERE user_id=?", (user_id,))
     r = cur.fetchone(); con.close()
     return r
 
 def register_user(tg_user, is_founder=False):
     con = db(); cur = con.cursor()
     now = datetime.now().isoformat(timespec="seconds")
-    cur.execute("SELECT * FROM users WHERE user_id=?", (tg_user.id,))
+    _ex(cur, "SELECT * FROM users WHERE user_id=?", (tg_user.id,))
     ex = cur.fetchone()
     if ex:
-        cur.execute("UPDATE users SET username=?, first_name=?, is_founder=? WHERE user_id=?",
+        _ex(cur, "UPDATE users SET username=?, first_name=?, is_founder=? WHERE user_id=?",
             (tg_user.username or "", tg_user.first_name or "", 1 if (is_founder or ex["is_founder"]) else 0, tg_user.id))
     else:
-        cur.execute("INSERT INTO users(user_id,username,first_name,is_founder,created) VALUES(?,?,?,?,?)",
+        _ex(cur, "INSERT INTO users(user_id,username,first_name,is_founder,created) VALUES(?,?,?,?,?)",
             (tg_user.id, tg_user.username or "", tg_user.first_name or "", 1 if is_founder else 0, now))
-        # yangi userga mavjud guruhlarni avtomatik biriktiramiz (kutilgan xatti-harakat)
-        cur.execute("SELECT chat_id FROM groups")
-        for g in cur.fetchall():
-            try:
-                cur.execute("INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?,?)", (tg_user.id, g["chat_id"]))
-            except Exception:
-                pass
+        # XAVFSIZLIK: yangi userga begona guruhlarni avtomatik biriktirmaymiz.
+        # U o'zi qo'shgan guruhlargagina yuboradi (add_group owner orqali).
     con.commit(); con.close()
 
 def is_founder_check(tg_user) -> bool:
+    if tg_user and tg_user.id in ADMIN_IDS:
+        return True
     if tg_user and tg_user.username and tg_user.username.lower() == FOUNDER_USERNAME.lower():
         return True
     if tg_user:
@@ -108,26 +154,51 @@ def is_founder_check(tg_user) -> bool:
             return True
     return False
 
-def add_group(chat_id, title, gtype):
+def _upsert_group(cur, chat_id, title, gtype, now):
+    if USE_PG:
+        cur.execute(
+            """INSERT INTO groups(chat_id,title,gtype,added_at) VALUES(%s,%s,%s,%s)
+               ON CONFLICT(chat_id) DO UPDATE SET title=EXCLUDED.title, gtype=EXCLUDED.gtype, added_at=EXCLUDED.added_at""",
+            (chat_id, title, gtype, now))
+    else:
+        cur.execute("INSERT OR REPLACE INTO groups(chat_id,title,gtype,added_at) VALUES(?,?,?,?)",
+                    (chat_id, title, gtype, now))
+
+def _link_user_group(cur, user_id, group_id):
+    if USE_PG:
+        cur.execute("INSERT INTO user_groups(user_id,group_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+                    (user_id, group_id))
+    else:
+        cur.execute("INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?,?)", (user_id, group_id))
+
+def add_group(chat_id, title, gtype, owner_id=None):
+    """Bot guruhga qo'shilganda chaqiriladi. Faqat qo'shgan odamga biriktiradi."""
     con = db(); cur = con.cursor()
     now = datetime.now().isoformat(timespec="seconds")
-    cur.execute("INSERT OR REPLACE INTO groups(chat_id,title,gtype,added_at) VALUES(?,?,?,?)",
-                (chat_id, title, gtype, now))
-    # yangi guruhni barcha userga avtomatik qo'shamiz (talab: qo'shgan guruhga yuborilsin)
-    cur.execute("SELECT user_id FROM users WHERE is_banned=0")
-    for u in cur.fetchall():
-        cur.execute("INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?,?)", (u["user_id"], chat_id))
+    _upsert_group(cur, chat_id, title, gtype, now)
+    if owner_id:
+        try:
+            _link_user_group(cur, owner_id, chat_id)
+        except Exception:
+            pass
+    con.commit(); con.close()
+
+def upsert_group_title(chat_id, title, gtype):
+    """Guruhdagi oddiy xabarlarda nomni yangilash — hech kimga auto-link qilmaydi."""
+    con = db(); cur = con.cursor()
+    now = datetime.now().isoformat(timespec="seconds")
+    _upsert_group(cur, chat_id, title, gtype, now)
     con.commit(); con.close()
 
 def remove_group(chat_id):
     con = db(); cur = con.cursor()
-    cur.execute("DELETE FROM groups WHERE chat_id=?", (chat_id,))
-    cur.execute("DELETE FROM user_groups WHERE group_id=?", (chat_id,))
+    _ex(cur, "DELETE FROM groups WHERE chat_id=?", (chat_id,))
+    _ex(cur, "DELETE FROM user_groups WHERE group_id=?", (chat_id,))
     con.commit(); con.close()
 
 def get_user_groups(user_id):
     con = db(); cur = con.cursor()
-    cur.execute("""SELECT g.chat_id, g.title, g.gtype FROM user_groups ug
+    _ex(cur, """SELECT g.chat_id, g.title, g.gtype FROM user_groups ug
                    JOIN groups g ON g.chat_id=ug.group_id WHERE ug.user_id=?""", (user_id,))
     rows = cur.fetchall(); con.close()
     return rows
@@ -140,34 +211,34 @@ def get_all_groups():
 
 def get_broadcast(user_id):
     con = db(); cur = con.cursor()
-    cur.execute("SELECT * FROM broadcasts WHERE user_id=?", (user_id,))
+    _ex(cur, "SELECT * FROM broadcasts WHERE user_id=?", (user_id,))
     r = cur.fetchone(); con.close()
     return r
 
 def save_broadcast_msg(user_id, src_chat, src_msg, preview, has_text=0):
     con = db(); cur = con.cursor()
-    cur.execute("SELECT * FROM broadcasts WHERE user_id=?", (user_id,))
+    _ex(cur, "SELECT * FROM broadcasts WHERE user_id=?", (user_id,))
     ex = cur.fetchone()
     if ex:
-        cur.execute("""UPDATE broadcasts SET source_chat_id=?, source_msg_id=?, preview=?, has_text=?
+        _ex(cur, """UPDATE broadcasts SET source_chat_id=?, source_msg_id=?, preview=?, has_text=?
                        WHERE user_id=?""", (src_chat, src_msg, preview, has_text, user_id))
     else:
-        cur.execute("""INSERT INTO broadcasts(user_id,source_chat_id,source_msg_id,preview,has_text,interval_min,is_active)
+        _ex(cur, """INSERT INTO broadcasts(user_id,source_chat_id,source_msg_id,preview,has_text,interval_min,is_active)
                        VALUES(?,?,?, ?,?,10,0)""", (user_id, src_chat, src_msg, preview, has_text))
     con.commit(); con.close()
 
 def set_interval(user_id, minutes):
     con = db(); cur = con.cursor()
-    cur.execute("SELECT * FROM broadcasts WHERE user_id=?", (user_id,))
+    _ex(cur, "SELECT * FROM broadcasts WHERE user_id=?", (user_id,))
     if not cur.fetchone():
-        cur.execute("INSERT INTO broadcasts(user_id,interval_min,is_active) VALUES(?,?,0)", (user_id, minutes))
+        _ex(cur, "INSERT INTO broadcasts(user_id,interval_min,is_active) VALUES(?,?,0)", (user_id, minutes))
     else:
-        cur.execute("UPDATE broadcasts SET interval_min=? WHERE user_id=?", (minutes, user_id))
+        _ex(cur, "UPDATE broadcasts SET interval_min=? WHERE user_id=?", (minutes, user_id))
     con.commit(); con.close()
 
 def set_active(user_id, active):
     con = db(); cur = con.cursor()
-    cur.execute("UPDATE broadcasts SET is_active=? WHERE user_id=?", (1 if active else 0, user_id))
+    _ex(cur, "UPDATE broadcasts SET is_active=? WHERE user_id=?", (1 if active else 0, user_id))
     con.commit(); con.close()
 
 # ============ KEYBOARDS ============
@@ -209,6 +280,13 @@ async def do_broadcast_to_user(user_id: int, context: ContextTypes.DEFAULT_TYPE,
                 message_id=bc["source_msg_id"],
             )
             ok += 1
+        except RetryAfter as e:
+            fail += 1
+            logger.warning(f"flood {g['chat_id']}: {e.retry_after}s kutamiz")
+            try:
+                await asyncio.sleep(e.retry_after + 1)
+            except Exception:
+                pass
         except Forbidden:
             fail += 1  # bot guruhdan chiqarilgan bo'lishi mumkin
         except BadRequest as e:
@@ -220,7 +298,14 @@ async def do_broadcast_to_user(user_id: int, context: ContextTypes.DEFAULT_TYPE,
         except Exception as e:
             fail += 1
             logger.warning(f"yuborishda xato {g['chat_id']}: {e}")
-        await asyncio.sleep(0.05)  # flood limit himoyasi
+        await asyncio.sleep(0.4)  # flood limit himoyasi (Telegram: ~20 msg/min)
+    try:
+        _now = datetime.now().isoformat(timespec="seconds")
+        con = db(); cur = con.cursor()
+        _ex(cur, "UPDATE broadcasts SET last_sent=? WHERE user_id=?", (_now, user_id))
+        con.commit(); con.close()
+    except Exception:
+        pass
     return ok, fail, reason
 
 async def broadcast_job(context: ContextTypes.DEFAULT_TYPE):
@@ -292,7 +377,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• ▶️ Start → avtomatik yuborish boshlanadi.\n"
         "• 🚀 Test yuborish → hozir 1 marta yuborib ko'rish.\n"
         "• ⏸ Stop → to'xtatish.\n\n"
-        "Founder: @dior_coder — 👑 Founder panel orqali to'liq boshqaradi.",
+        f"Founder: @{FOUNDER_USERNAME} — 👑 Founder panel orqali to'liq boshqaradi.",
         parse_mode="HTML",
     )
 
@@ -303,17 +388,22 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_status = result.new_chat_member.status
     if chat.type in ("group", "supergroup", "channel"):
         if new_status in ("member", "administrator"):
-            add_group(chat.id, chat.title or str(chat.id), chat.type)
-            logger.info(f"Bot qo'shildi: {chat.title} ({chat.id})")
+            owner_id = None
+            try:
+                owner_id = result.from_user.id if result.from_user and not result.from_user.is_bot else None
+            except Exception:
+                pass
+            add_group(chat.id, chat.title or str(chat.id), chat.type, owner_id=owner_id)
+            logger.info(f"Bot qo'shildi: {chat.title} ({chat.id}) owner={owner_id}")
         elif new_status in ("left", "kicked"):
             remove_group(chat.id)
             logger.info(f"Bot chiqarildi: {chat.id}")
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # guruh nomlarini yangilab turish
+    # guruh nomlarini yangilab turish (auto-link YO'Q)
     chat = update.effective_chat
     if chat.type in ("group", "supergroup", "channel"):
-        add_group(chat.id, chat.title or str(chat.id), chat.type)
+        upsert_group_title(chat.id, chat.title or str(chat.id), chat.type)
 
 async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
@@ -355,8 +445,14 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_message(uid, f"📢 <b>Founder xabari:</b>\n\n{text}", parse_mode="HTML")
                 ok += 1
+            except RetryAfter as e:
+                try:
+                    await asyncio.sleep(e.retry_after + 1)
+                except Exception:
+                    pass
             except Exception:
                 pass
+            await asyncio.sleep(0.05)
         await update.message.reply_text(f"✅ Announce {ok} userga yuborildi.", reply_markup=main_menu_kb(founder))
         return
 
@@ -488,28 +584,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             return
         con = db(); cur = con.cursor()
-        cur.execute("SELECT * FROM user_groups WHERE user_id=? AND group_id=?", (user_id, gid))
+        _ex(cur, "SELECT * FROM user_groups WHERE user_id=? AND group_id=?", (user_id, gid))
         if cur.fetchone():
-            cur.execute("DELETE FROM user_groups WHERE user_id=? AND group_id=?", (user_id, gid))
+            _ex(cur, "DELETE FROM user_groups WHERE user_id=? AND group_id=?", (user_id, gid))
             act = "o'chirildi ❌"
         else:
-            cur.execute("INSERT INTO user_groups(user_id,group_id) VALUES(?,?)", (user_id, gid))
+            _link_user_group(cur, user_id, gid)
             act = "qo'shildi ✅"
         con.commit(); con.close()
         await q.edit_message_text(f"{act} (guruh: {gid})\n📋 Guruhlarim ni qayta ochib ro'yxatni ko'ring.")
         return
 
     if data == "a:all":
-        groups = get_all_groups()
+        groups = get_user_groups(user_id)  # xavfsizlik: faqat o'ziga tegishli emas, barcha mavjuddan tanlashga ruxsat?
+        # To'g'risi: user o'zi qo'shgan guruhlarni tanlashi uchun barcha guruhlar ro'yxatidan tanlaydi,
+        # lekin bu yerda faqat mavjud guruhlarni biriktiramiz (o'z guruhlari + umumiy).
+        all_groups = get_all_groups()
         con = db(); cur = con.cursor()
-        for g in groups:
-            cur.execute("INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?,?)", (user_id, g["chat_id"]))
+        for g in all_groups:
+            _link_user_group(cur, user_id, g["chat_id"])
         con.commit(); con.close()
-        await q.edit_message_text(f"✅ Hamma guruhlar tanlandi ({len(groups)} ta).")
+        await q.edit_message_text(f"✅ Hamma guruhlar tanlandi ({len(all_groups)} ta).")
         return
     if data == "a:none":
         con = db(); cur = con.cursor()
-        cur.execute("DELETE FROM user_groups WHERE user_id=?", (user_id,))
+        _ex(cur, "DELETE FROM user_groups WHERE user_id=?", (user_id,))
         con.commit(); con.close()
         await q.edit_message_text("🧹 Tanlov tozalandi.")
         return
@@ -556,11 +655,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("b:"):
         uid = int(data[2:])
         con = db(); cur = con.cursor()
-        cur.execute("SELECT * FROM users WHERE user_id=?", (uid,))
+        _ex(cur, "SELECT * FROM users WHERE user_id=?", (uid,))
         r = cur.fetchone()
         if r:
             new_ban = 0 if r["is_banned"] else 1
-            cur.execute("UPDATE users SET is_banned=? WHERE user_id=?", (new_ban, uid))
+            _ex(cur, "UPDATE users SET is_banned=? WHERE user_id=?", (new_ban, uid))
             con.commit()
             await q.edit_message_text(f"{'🚫 Ban qilindi' if new_ban else '✅ Ban olindi'}: {uid}", reply_markup=founder_kb())
         con.close()
@@ -622,7 +721,7 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (~filters.TEXT), private_media))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (~filters.StatusUpdate.ALL), on_group_message))
     app.add_handler(CallbackQueryHandler(on_callback))
-    print("✅ Bot ishga tushdi. Founder: @dior_coder")
+    print(f"✅ Bot ishga tushdi. Founder: @{FOUNDER_USERNAME} | DB: {'Postgres' if USE_PG else 'sqlite'}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

@@ -32,15 +32,15 @@ class handler(BaseHTTPRequestHandler):
                     continue
                 uid = bc["user_id"]
                 con2 = S.db(); cur2 = con2.cursor()
-                cur2.execute("""SELECT g.chat_id FROM user_groups ug JOIN groups g ON g.chat_id=ug.group_id
+                S._ex(cur2, """SELECT g.chat_id FROM user_groups ug JOIN groups g ON g.chat_id=ug.group_id
                                 WHERE ug.user_id=?""", (uid,))
                 groups = cur2.fetchall()
                 con2.close()
                 for g in groups:
                     T.copy_message(g["chat_id"], bc["source_chat_id"], bc["source_msg_id"])
                 con3 = S.db(); cur3 = con3.cursor()
-                cur3.execute("UPDATE broadcasts SET last_sent=? WHERE user_id=?",
-                             (now.isoformat(timespec="seconds"), uid))
+                S._ex(cur3, "UPDATE broadcasts SET last_sent=? WHERE user_id=?",
+                      (now.isoformat(timespec="seconds"), uid))
                 con3.commit(); con3.close()
                 sent += 1
             self.send_response(200)

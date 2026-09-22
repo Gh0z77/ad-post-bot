@@ -49,6 +49,9 @@ def main_menu(is_founder=False):
 def founder_inline():
     return {"inline_keyboard": [
         [{"text": "📊 Statistika", "callback_data": "f:stats"},
-         {"text": "📋 Guruhlar", "callback_data": "f:groups"}],
+         {"text": "📋 Barcha guruhlar", "callback_data": "f:groups"}],
+        [{"text": "👥 Userlar", "callback_data": "f:users"},
+         {"text": "📢 Announce", "callback_data": "f:announce"}],
         [{"text": "⛔ Hammasini to'xtatish", "callback_data": "f:stopall"}],
+        [{"text": "◀️ Orqaga", "callback_data": "m:main"}],
     ]}
