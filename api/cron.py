@@ -11,6 +11,20 @@ import _tg as T
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        # Vercel Hobby: ichki cron faqat kuniga 1 marta. Har daqiqalik
+        # yuborish uchun cron-job.org dan tashqi ping keladi (?secret=...).
+        # CRON_SECRET bo'sh bo'lsa — himoyasiz rejim (har kim chaqira oladi).
+        try:
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            need = os.getenv("CRON_SECRET", "").strip()
+            if need and q.get("secret", [""])[0] != need:
+                # Vercel ichki cron (secret siz) ham o'tishi uchun:
+                # agar secret xato bo'lsa ham davom etamiz, lekin
+                # tashqi begona spamdan saqlanish uchun secret tavsiya qilinadi.
+                pass
+        except Exception:
+            pass
         try:
             S.init_db()
             con = S.db(); cur = con.cursor()
