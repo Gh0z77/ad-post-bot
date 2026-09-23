@@ -1,14 +1,25 @@
 """Umumiy DB: DATABASE_URL (Postgres/Neon) bo'lsa Postgres, bo'lmasa sqlite.
-Vercel'da /tmp ephemeral — doimiy uchun DATABASE_URL shart."""
+Vercel'da /tmp ephemeral — doimiy uchun DATABASE_URL tavsiya qilinadi."""
 import os
 import sqlite3
 
 IS_VERCEL = bool(os.getenv("VERCEL"))
-if IS_VERCEL and not os.getenv("DATABASE_URL"):
-    # XAVFSIZLIK: Vercel /tmp ephemeral — ma'lumot yo'qoladi.
-    # Prod da DATABASE_URL (Neon/Supabase) shart.
-    raise RuntimeError("Vercel'da DATABASE_URL shart! Vercel Env ga Postgres (Neon/Supabase) URL qo'shing.")
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bot.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
+USE_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+
+if IS_VERCEL and not USE_PG:
+    # Vercel'da filesystem ephemeral (/tmp dan tashqari yozib bo'lmaydi).
+    # Oldingi versiya RuntimeError berib 500 qaytarardi — bot "ishlamaydi"dek ko'rinardi.
+    # Endi crash o'rniga temp fallback ishlaydi (bot javob beradi),
+    # doimiy saqlash uchun Vercel Env ga DATABASE_URL qo'shish tavsiya qilinadi.
+    import tempfile as _tf
+    DB_PATH = os.path.join(_tf.gettempdir(), "bot.db")
+    print("WARNING: DATABASE_URL yo'q — temp bot.db (ephemeral) ishlatilmoqda. "
+          "Doimiy baza uchun Neon/Supabase Postgres URL ni Vercel Env ga qo'shing.")
+else:
+    DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bot.db")
 
 FOUNDER_USERNAME = os.getenv("FOUNDER_USERNAME", "dior_coder")
 _raw_admins = os.getenv("ADMIN_IDS", "") or os.getenv("FOUNDER_IDS", "")
@@ -16,11 +27,6 @@ try:
     ADMIN_IDS = {int(x.strip()) for x in _raw_admins.split(",") if x.strip().lstrip("-").isdigit()}
 except Exception:
     ADMIN_IDS = set()
-
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-USE_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 
 _pg_mods = {}
 if USE_PG:

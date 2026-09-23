@@ -3,16 +3,29 @@ import os
 import json
 import urllib.request
 
+
+def _token():
+    return os.getenv("BOT_TOKEN", "").strip()
+
+
+def _api_base():
+    t = _token()
+    return f"https://api.telegram.org/bot{t}" if t else ""
+
+
+# Eski kod bilan moslik uchun (import paytida o'qilgan qiymat eskirib qolmasligi uchun
+# funksiyalar har safar env dan o'qiydi; bu o'zgaruvchilar faqat fallback).
 TOKEN = os.getenv("BOT_TOKEN", "")
 API = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else ""
 
 
 def api_call(method, payload):
-    if not TOKEN:
-        print("BOT_TOKEN yo'q")
-        return {}
+    base = _api_base()
+    if not base:
+        print("BOT_TOKEN yo'q (Vercel Env ga BOT_TOKEN qo'shing!)")
+        return {"ok": False, "description": "BOT_TOKEN missing"}
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(f"{API}/{method}", data=data,
+    req = urllib.request.Request(f"{base}/{method}", data=data,
                                  headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=20) as r:

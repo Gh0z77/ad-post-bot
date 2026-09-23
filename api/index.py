@@ -249,6 +249,22 @@ def handle(update):
         return
 
     if "message" not in update:
+        # Kanallar: channel_post / edited_channel_post ham xuddi message kabi keladi.
+        # Bot kanalga admin bo'lsa — nomni yangilash uchun shu yerda ushlaymiz.
+        for _ck in ("channel_post", "edited_channel_post", "edited_message"):
+            if _ck in update:
+                _m = update[_ck]
+                _chat = _m.get("chat", {})
+                if _chat.get("type") in ("group", "supergroup", "channel"):
+                    try:
+                        con = S.db(); cur = con.cursor()
+                        S.upsert_group(cur, _chat["id"], _chat.get("title") or str(_chat["id"]),
+                                       _chat.get("type", "channel"),
+                                       datetime.now().isoformat(timespec="seconds"))
+                        con.commit(); con.close()
+                    except Exception as _e:
+                        print("channel_post db xato:", _e)
+                return
         return
     msg = update["message"]
     chat = msg["chat"]
@@ -430,12 +446,106 @@ def handle(update):
             T.send_message(uid, "Menyudan tanlang 👇", reply_markup=T.main_menu(founder))
 
 
+def run_due_broadcasts():
+    """Cron logikasi — /api/cron bilan bir xil. Vercel routing muammosi bo'lsa
+    /api/index?cron=1 orqali ham chaqirish mumkin (cron-job.org uchun zaxira)."""
+    try:
+        from datetime import timedelta
+        S.init_db()
+        con = S.db(); cur = con.cursor()
+        cur.execute("SELECT * FROM broadcasts WHERE is_active=1 AND source_msg_id IS NOT NULL")
+        rows = cur.fetchall()
+        con.close()
+        sent = 0
+        now = datetime.now()
+        for bc in rows:
+            iv = bc["interval_min"] or 10
+            last = bc["last_sent"]
+            due = True
+            if last:
+                try:
+                    due = now - datetime.fromisoformat(last) >= timedelta(minutes=iv)
+                except Exception:
+                    due = True
+            if not due:
+                continue
+            uid = bc["user_id"]
+            con2 = S.db(); cur2 = con2.cursor()
+            S._ex(cur2, """SELECT g.chat_id FROM user_groups ug JOIN groups g ON g.chat_id=ug.group_id
+                            WHERE ug.user_id=?""", (uid,))
+            groups = cur2.fetchall()
+            con2.close()
+            for g in groups:
+                r = T.copy_message(g["chat_id"], bc["source_chat_id"], bc["source_msg_id"])
+                if not r.get("ok"):
+                    desc = str(r).lower()
+                    if "not found" in desc or "deleted" in desc or "kicked" in desc:
+                        try:
+                            conx = S.db(); curx = conx.cursor()
+                            S._ex(curx, "DELETE FROM groups WHERE chat_id=?", (g["chat_id"],))
+                            S._ex(curx, "DELETE FROM user_groups WHERE group_id=?", (g["chat_id"],))
+                            S._ex(curx, "DELETE FROM group_owners WHERE group_id=?", (g["chat_id"],))
+                            conx.commit(); conx.close()
+                        except Exception:
+                            pass
+                time.sleep(0.1)
+            con3 = S.db(); cur3 = con3.cursor()
+            S._ex(cur3, "UPDATE broadcasts SET last_sent=? WHERE user_id=?",
+                  (now.isoformat(timespec="seconds"), uid))
+            con3.commit(); con3.close()
+            sent += 1
+        return sent
+    except Exception as e:
+        print("cron xato:", e)
+        raise
+
+
+def health_info():
+    import os as _os
+    tok = bool(_os.getenv("BOT_TOKEN", "").strip())
+    try:
+        S.init_db()
+        con = S.db(); cur = con.cursor()
+        cur.execute("SELECT COUNT(*) c FROM users"); uc = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) c FROM groups"); gc = cur.fetchone()["c"]
+        con.close()
+        db_ok, db_mode = True, ("pg" if S.USE_PG else "sqlite:" + S.DB_PATH)
+    except Exception as e:
+        uc, gc, db_ok, db_mode = 0, 0, False, f"error: {e}"
+    return {"ok": True, "service": "ad-post-bot webhook",
+            "token": tok, "db_ok": db_ok, "db": db_mode,
+            "users": uc, "groups": gc}
+
+
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        from urllib.parse import urlparse, parse_qs
+        try:
+            u = urlparse(self.path)
+            q = parse_qs(u.query)
+            path = u.path or ""
+            # Zaxira cron yo'li: /api/index?cron=1 yoki /api/cron -> index ga tushib qolsa
+            if path.endswith("/cron") or q.get("cron", [""])[0] == "1":
+                try:
+                    sent = run_due_broadcasts()
+                    body = ('{"ok":true,"sent":%d}' % sent).encode()
+                except Exception:
+                    self.send_response(500)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            body = json.dumps(health_info()).encode()
+        except Exception as e:
+            print("GET xato:", e)
+            body = b'{"ok":true,"service":"ad-post-bot webhook"}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(b'{"ok":true,"service":"ad-post-bot webhook"}')
+        self.wfile.write(body)
 
     def do_POST(self):
         try:
