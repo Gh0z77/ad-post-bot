@@ -37,7 +37,18 @@ class handler(BaseHTTPRequestHandler):
                 groups = cur2.fetchall()
                 con2.close()
                 for g in groups:
-                    T.copy_message(g["chat_id"], bc["source_chat_id"], bc["source_msg_id"])
+                    r = T.copy_message(g["chat_id"], bc["source_chat_id"], bc["source_msg_id"])
+                    if not r.get("ok"):
+                        desc = str(r).lower()
+                        if "not found" in desc or "deleted" in desc or "kicked" in desc:
+                            try:
+                                conx = S.db(); curx = conx.cursor()
+                                S._ex(curx, "DELETE FROM groups WHERE chat_id=?", (g["chat_id"],))
+                                S._ex(curx, "DELETE FROM user_groups WHERE group_id=?", (g["chat_id"],))
+                                S._ex(curx, "DELETE FROM group_owners WHERE group_id=?", (g["chat_id"],))
+                                conx.commit(); conx.close()
+                            except Exception:
+                                pass
                 con3 = S.db(); cur3 = con3.cursor()
                 S._ex(cur3, "UPDATE broadcasts SET last_sent=? WHERE user_id=?",
                       (now.isoformat(timespec="seconds"), uid))

@@ -36,10 +36,11 @@ def copy_message(chat_id, from_chat_id, message_id):
 
 def main_menu(is_founder=False):
     kb = [
+        [{"text": "🌐 Web panel"}, {"text": "📊 Status"}],
         [{"text": "📝 Xabar yaratish"}, {"text": "⏱ Interval"}],
-        [{"text": "📋 Guruhlarim"}, {"text": "📊 Status"}],
-        [{"text": "▶️ Start"}, {"text": "⏸ Stop"}],
-        [{"text": "🚀 Test yuborish"}, {"text": "❓ Yordam"}],
+        [{"text": "📋 Guruhlarim"}, {"text": "▶️ Start"}],
+        [{"text": "⏸ Stop"}, {"text": "🚀 Test yuborish"}],
+        [{"text": "❓ Yordam"}],
     ]
     if is_founder:
         kb.append([{"text": "👑 Founder panel"}])

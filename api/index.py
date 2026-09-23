@@ -73,6 +73,7 @@ def do_broadcast(uid):
                     con2 = S.db(); cur2 = con2.cursor()
                     S._ex(cur2, "DELETE FROM groups WHERE chat_id=?", (g["chat_id"],))
                     S._ex(cur2, "DELETE FROM user_groups WHERE group_id=?", (g["chat_id"],))
+                    S._ex(cur2, "DELETE FROM group_owners WHERE group_id=?", (g["chat_id"],))
                     con2.commit(); con2.close()
                 except Exception:
                     pass
@@ -109,12 +110,14 @@ def handle(update):
                 owner_id = owner.get("id")
                 if owner_id and not owner.get("is_bot"):
                     try:
+                        S.link_owner(cur, owner_id, chat["id"])
                         S.link_user_group(cur, owner_id, chat["id"])
                     except Exception:
                         pass
             else:
                 S._ex(cur, "DELETE FROM groups WHERE chat_id=?", (chat["id"],))
                 S._ex(cur, "DELETE FROM user_groups WHERE group_id=?", (chat["id"],))
+                S._ex(cur, "DELETE FROM group_owners WHERE group_id=?", (chat["id"],))
             con.commit(); con.close()
         return
 
@@ -132,6 +135,11 @@ def handle(update):
                 gid = int(data[2:])
             except ValueError:
                 return
+            # XAVFSIZLIK: begona guruhni toggle qilish taqiqlanadi (founder dan tashqari)
+            if not founder and not S.is_owner(uid, gid):
+                T.api_call("editMessageText", {"chat_id": uid, "message_id": msg_id,
+                    "text": "⛔ Bu guruh sizniki emas. Botni o'z guruhingizga o'zingiz qo'shing."})
+                return
             con = S.db(); cur = con.cursor()
             S._ex(cur, "SELECT * FROM user_groups WHERE user_id=? AND group_id=?", (uid, gid))
             if cur.fetchone():
@@ -144,15 +152,24 @@ def handle(update):
             T.api_call("editMessageText", {"chat_id": uid, "message_id": msg_id, "text": txt})
             return
         if data == "a:all":
-            con = S.db(); cur = con.cursor()
-            cur.execute("SELECT chat_id FROM groups")
-            n = 0
-            for g in cur.fetchall():
-                S.link_user_group(cur, uid, g["chat_id"])
-                n += 1
-            con.commit(); con.close()
+            # XAVFSIZLIK: faqat o'z egalik guruhlari (founder bo'lsa hammasi)
+            if founder:
+                con = S.db(); cur = con.cursor()
+                cur.execute("SELECT chat_id FROM groups LIMIT 100")
+                owned = cur.fetchall()
+                for g in owned:
+                    S.link_user_group(cur, uid, g["chat_id"])
+                n = len(owned)
+                con.commit(); con.close()
+            else:
+                owned = S.get_owned_groups(uid)
+                con = S.db(); cur = con.cursor()
+                for g in owned:
+                    S.link_user_group(cur, uid, g["chat_id"])
+                n = len(owned)
+                con.commit(); con.close()
             T.api_call("editMessageText", {"chat_id": uid, "message_id": msg_id,
-                                           "text": f"✅ Hamma guruhlar tanlandi ({n} ta)."})
+                                           "text": f"✅ Hamma o'z guruhlaringiz tanlandi ({n} ta)."})
             return
         if data == "a:none":
             con = S.db(); cur = con.cursor()
@@ -257,18 +274,29 @@ def handle(update):
     text = (msg.get("text") or "").strip()
     state = S.get_state(uid)
 
-    if state == "wait_announce" and founder and text:
+    if state == "wait_announce" and founder:
+        has_media = bool(msg.get("photo") or msg.get("video") or msg.get("document") or msg.get("audio") or msg.get("voice"))
+        if not text and not has_media:
+            T.send_message(uid, "❌ Announce uchun matn yoki media yuboring.")
+            return
         S.set_state(uid, None)
         con = S.db(); cur = con.cursor()
         cur.execute("SELECT user_id FROM users WHERE is_banned=0")
         users = [r["user_id"] for r in cur.fetchall()]; con.close()
         ok = 0
         for u in users:
-            r = T.send_message(u, f"📢 <b>Founder xabari:</b>\n\n{text}")
+            if has_media:
+                r = T.copy_message(u, chat["id"], msg["message_id"])
+            else:
+                r = T.send_message(u, f"📢 <b>Founder xabari:</b>\n\n{text}")
             if r.get("ok"):
                 ok += 1
             time.sleep(0.05)
         T.send_message(uid, f"✅ Announce {ok} userga yuborildi.", reply_markup=T.main_menu(founder))
+        return
+    if state == "wait_announce" and not founder:
+        S.set_state(uid, None)
+        T.send_message(uid, "⛔ Faqat founder uchun.", reply_markup=T.main_menu(founder))
         return
 
     if state == "wait_interval" and text:
@@ -354,13 +382,23 @@ def handle(update):
             T.send_message(uid, f"📊 {'🟢 Faol' if bc['is_active'] else '🔴 Stop'} | Har {bc['interval_min']} min | Guruh: {gc}",
                            reply_markup=T.main_menu(founder))
     elif text == "📋 Guruhlarim":
-        con = S.db(); cur = con.cursor()
-        cur.execute("SELECT * FROM groups ORDER BY added_at DESC LIMIT 30"); groups = cur.fetchall()
-        S._ex(cur, "SELECT group_id FROM user_groups WHERE user_id=?", (uid,))
-        my = {r["group_id"] for r in cur.fetchall()}
-        con.close()
+        # XAVFSIZLIK: faqat o'z egalik guruhlari (founder bo'lsa hammasi)
+        if founder:
+            con = S.db(); cur = con.cursor()
+            cur.execute("SELECT * FROM groups ORDER BY added_at DESC LIMIT 30"); groups = cur.fetchall()
+            S._ex(cur, "SELECT group_id FROM user_groups WHERE user_id=?", (uid,))
+            my = {r["group_id"] for r in cur.fetchall()}
+            con.close()
+        else:
+            owned = S.get_owned_groups(uid)
+            con = S.db(); cur = con.cursor()
+            S._ex(cur, "SELECT group_id FROM user_groups WHERE user_id=?", (uid,))
+            my = {r["group_id"] for r in cur.fetchall()}
+            con.close()
+            # owned allaqachon groups bilan join qilingan
+            groups = owned
         if not groups:
-            T.send_message(uid, "📭 Guruh yo'q. Botni guruhga qo'shing (o'zingiz qo'shganingiz sizga biriktiriladi).")
+            T.send_message(uid, "📭 Guruh yo'q. Botni guruhga o'zingiz qo'shing (o'zingiz qo'shganingiz sizga biriktiriladi).")
         else:
             kb = [[{"text": f"{'✅' if g['chat_id'] in my else '❌'} {(g['title'] or '')[:25]}",
                     "callback_data": f"t:{g['chat_id']}"}] for g in groups]
@@ -374,19 +412,22 @@ def handle(update):
             T.send_message(uid, "⛔ Faqat founder.")
     elif text == "❓ Yordam":
         T.send_message(uid, "Botni guruhga admin qiling → 📝 Xabar → ⏱ Interval → 📋 Guruhlarim → ▶️ Start.\nVercel'da yuborish har daqiqalik cron orqali ishlaydi.")
+    elif text == "🌐 Web panel":
+        import os as _os
+        _web = (_os.getenv("WEB_URL", "").rstrip("/") + f"/dash?uid={uid}") if _os.getenv("WEB_URL") else ""
+        if _web:
+            T.send_message(uid, f"🌐 <b>Web panel:</b>\n{_web}\n\nBrauzerda oching — hamma funksiya shu yerda.",
+                           reply_markup=T.main_menu(founder))
+        else:
+            T.send_message(uid, "🌐 Web panel hali sozlanmagan (WEB_URL yo'q).", reply_markup=T.main_menu(founder))
     elif text and not text.startswith("/"):
-        if msg.get("photo") or msg.get("video") or msg.get("document") or len(text) > 1:
-            preview = (text or msg.get("caption") or "[media]")[:200]
-            con = S.db(); cur = con.cursor()
-            S._ex(cur, "SELECT * FROM broadcasts WHERE user_id=?", (uid,))
-            if cur.fetchone():
-                S._ex(cur, "UPDATE broadcasts SET source_chat_id=?, source_msg_id=?, preview=? WHERE user_id=?",
-                      (chat["id"], msg["message_id"], preview, uid))
-            else:
-                S._ex(cur, """INSERT INTO broadcasts(user_id,source_chat_id,source_msg_id,preview,interval_min,is_active)
-                               VALUES(?,?,?,?,10,0)""", (uid, chat["id"], msg["message_id"], preview))
-            con.commit(); con.close()
-            T.send_message(uid, "✅ Xabar saqlandi!", reply_markup=T.main_menu(founder))
+        # XAVFSIZLIK: state siz hech narsa avtomatik saqlanmaydi (tasodifiy overwrite oldini olish).
+        has_media = bool(msg.get("photo") or msg.get("video") or msg.get("document"))
+        if has_media:
+            T.send_message(uid, "Avval 📝 Xabar yaratish ni bosing, keyin media yuboring.",
+                           reply_markup=T.main_menu(founder))
+        else:
+            T.send_message(uid, "Menyudan tanlang 👇", reply_markup=T.main_menu(founder))
 
 
 class handler(BaseHTTPRequestHandler):

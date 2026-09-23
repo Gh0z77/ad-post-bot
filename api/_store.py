@@ -5,9 +5,10 @@ import sqlite3
 
 IS_VERCEL = bool(os.getenv("VERCEL"))
 if IS_VERCEL and not os.getenv("DATABASE_URL"):
-    DB_PATH = "/tmp/bot.db"
-else:
-    DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bot.db")
+    # XAVFSIZLIK: Vercel /tmp ephemeral — ma'lumot yo'qoladi.
+    # Prod da DATABASE_URL (Neon/Supabase) shart.
+    raise RuntimeError("Vercel'da DATABASE_URL shart! Vercel Env ga Postgres (Neon/Supabase) URL qo'shing.")
+DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bot.db")
 
 FOUNDER_USERNAME = os.getenv("FOUNDER_USERNAME", "dior_coder")
 _raw_admins = os.getenv("ADMIN_IDS", "") or os.getenv("FOUNDER_IDS", "")
@@ -54,6 +55,8 @@ def init_db():
         chat_id BIGINT PRIMARY KEY, title TEXT, gtype TEXT, added_at TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS user_groups(
         user_id BIGINT, group_id BIGINT, PRIMARY KEY(user_id, group_id))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS group_owners(
+        user_id BIGINT, group_id BIGINT, PRIMARY KEY(user_id, group_id))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS broadcasts(
         user_id BIGINT PRIMARY KEY, source_chat_id BIGINT, source_msg_id BIGINT,
         preview TEXT, has_text INTEGER DEFAULT 0,
@@ -74,6 +77,14 @@ def init_db():
                 cur.execute("ALTER TABLE broadcasts ADD COLUMN last_sent TEXT")
     except Exception:
         pass
+    # Migratsiya: eski user_groups dagi egalikni group_owners ga ko'chirish
+    try:
+        if USE_PG:
+            cur.execute("INSERT INTO group_owners(user_id,group_id) SELECT user_id,group_id FROM user_groups ON CONFLICT DO NOTHING")
+        else:
+            cur.execute("INSERT OR IGNORE INTO group_owners(user_id,group_id) SELECT user_id,group_id FROM user_groups")
+    except Exception:
+        pass
     con.commit()
     con.close()
 
@@ -84,6 +95,30 @@ def link_user_group(cur, user_id, group_id):
                     (user_id, group_id))
     else:
         cur.execute("INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?,?)", (user_id, group_id))
+
+
+def link_owner(cur, user_id, group_id):
+    if USE_PG:
+        cur.execute("INSERT INTO group_owners(user_id,group_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+                    (user_id, group_id))
+    else:
+        cur.execute("INSERT OR IGNORE INTO group_owners(user_id,group_id) VALUES(?,?)", (user_id, group_id))
+
+
+def is_owner(user_id, group_id):
+    con = db(); cur = con.cursor()
+    _ex(cur, "SELECT 1 FROM group_owners WHERE user_id=? AND group_id=?", (user_id, group_id))
+    r = cur.fetchone(); con.close()
+    return bool(r)
+
+
+def get_owned_groups(user_id):
+    con = db(); cur = con.cursor()
+    _ex(cur, """SELECT g.chat_id, g.title, g.gtype FROM group_owners o
+                   JOIN groups g ON g.chat_id=o.group_id WHERE o.user_id=? ORDER BY g.title""",
+        (user_id,))
+    rows = cur.fetchall(); con.close()
+    return rows
 
 
 def upsert_group(cur, chat_id, title, gtype, now):

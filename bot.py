@@ -41,6 +41,7 @@ USE_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 if DATABASE_URL.startswith("postgres://"):
     # psycopg2 eski sxemani tushunmaydi
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
+WEB_URL = os.getenv("WEB_URL", "").rstrip("/")
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
 
 _pg_mods = {}
@@ -95,6 +96,13 @@ def init_db():
         user_id BIGINT, group_id BIGINT,
         PRIMARY KEY(user_id, group_id)
     )""")
+    # group_owners: kim qaysi guruhni qo'shganini eslab qoladi (egalik).
+    # user_groups: qaysi guruhga yuborish tanlanganini bildiradi (tanlov).
+    # Ajratish shart: toggle o'chirilganda egalik yo'qolmasligi uchun.
+    cur.execute("""CREATE TABLE IF NOT EXISTS group_owners(
+        user_id BIGINT, group_id BIGINT,
+        PRIMARY KEY(user_id, group_id)
+    )""")
     cur.execute("""CREATE TABLE IF NOT EXISTS broadcasts(
         user_id BIGINT PRIMARY KEY,
         source_chat_id BIGINT,
@@ -117,6 +125,15 @@ def init_db():
                 cur.execute("ALTER TABLE broadcasts ADD COLUMN last_sent TEXT")
             if "has_text" not in cols:
                 cur.execute("ALTER TABLE broadcasts ADD COLUMN has_text INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    # Migratsiya: eski DB da egalik user_groups da aralash saqlangan —
+    # uni group_owners ga ko'chirib olamiz (bir martalik, xavfsiz).
+    try:
+        if USE_PG:
+            cur.execute("INSERT INTO group_owners(user_id,group_id) SELECT user_id,group_id FROM user_groups ON CONFLICT DO NOTHING")
+        else:
+            cur.execute("INSERT OR IGNORE INTO group_owners(user_id,group_id) SELECT user_id,group_id FROM user_groups")
     except Exception:
         pass
     con.commit()
@@ -171,6 +188,32 @@ def _link_user_group(cur, user_id, group_id):
     else:
         cur.execute("INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?,?)", (user_id, group_id))
 
+def _link_owner(cur, user_id, group_id):
+    """Egalikni eslab qoladi — tanlovdan mustaqil."""
+    if USE_PG:
+        cur.execute("INSERT INTO group_owners(user_id,group_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+                    (user_id, group_id))
+    else:
+        cur.execute("INSERT OR IGNORE INTO group_owners(user_id,group_id) VALUES(?,?)", (user_id, group_id))
+
+def is_group_owner(user_id, group_id, founder=False):
+    """Founder har qanday guruhni boshqaradi, oddiy user faqat o'zinikini."""
+    if founder:
+        return True
+    con = db(); cur = con.cursor()
+    _ex(cur, "SELECT 1 FROM group_owners WHERE user_id=? AND group_id=?", (user_id, group_id))
+    r = cur.fetchone(); con.close()
+    return bool(r)
+
+def get_owned_groups(user_id):
+    """Faqat user o'zi qo'shgan (egalik qilgan) guruhlar."""
+    con = db(); cur = con.cursor()
+    _ex(cur, """SELECT g.chat_id, g.title, g.gtype FROM group_owners o
+                   JOIN groups g ON g.chat_id=o.group_id WHERE o.user_id=? ORDER BY g.title""",
+        (user_id,))
+    rows = cur.fetchall(); con.close()
+    return rows
+
 def add_group(chat_id, title, gtype, owner_id=None):
     """Bot guruhga qo'shilganda chaqiriladi. Faqat qo'shgan odamga biriktiradi."""
     con = db(); cur = con.cursor()
@@ -178,7 +221,8 @@ def add_group(chat_id, title, gtype, owner_id=None):
     _upsert_group(cur, chat_id, title, gtype, now)
     if owner_id:
         try:
-            _link_user_group(cur, owner_id, chat_id)
+            _link_owner(cur, owner_id, chat_id)
+            _link_user_group(cur, owner_id, chat_id)  # avtomatik tanlangan
         except Exception:
             pass
     con.commit(); con.close()
@@ -194,18 +238,19 @@ def remove_group(chat_id):
     con = db(); cur = con.cursor()
     _ex(cur, "DELETE FROM groups WHERE chat_id=?", (chat_id,))
     _ex(cur, "DELETE FROM user_groups WHERE group_id=?", (chat_id,))
+    _ex(cur, "DELETE FROM group_owners WHERE group_id=?", (chat_id,))
     con.commit(); con.close()
 
 def get_user_groups(user_id):
     con = db(); cur = con.cursor()
     _ex(cur, """SELECT g.chat_id, g.title, g.gtype FROM user_groups ug
-                   JOIN groups g ON g.chat_id=ug.group_id WHERE ug.user_id=?""", (user_id,))
+                   JOIN groups g ON g.chat_id=ug.group_id WHERE ug.user_id=? ORDER BY g.title""", (user_id,))
     rows = cur.fetchall(); con.close()
     return rows
 
-def get_all_groups():
+def get_all_groups(limit=100):
     con = db(); cur = con.cursor()
-    cur.execute("SELECT * FROM groups ORDER BY added_at DESC")
+    cur.execute("SELECT * FROM groups ORDER BY added_at DESC LIMIT %s" % (int(limit),))
     rows = cur.fetchall(); con.close()
     return rows
 
@@ -242,12 +287,18 @@ def set_active(user_id, active):
     con.commit(); con.close()
 
 # ============ KEYBOARDS ============
+def web_panel_url(user_id):
+    if WEB_URL:
+        return f"{WEB_URL}/dash?uid={user_id}"
+    return None
+
 def main_menu_kb(is_founder=False):
     rows = [
+        [KeyboardButton("🌐 Web panel"), KeyboardButton("📊 Status")],
         [KeyboardButton("📝 Xabar yaratish"), KeyboardButton("⏱ Interval")],
-        [KeyboardButton("📋 Guruhlarim"), KeyboardButton("📊 Status")],
-        [KeyboardButton("▶️ Start"), KeyboardButton("⏸ Stop")],
-        [KeyboardButton("🚀 Test yuborish"), KeyboardButton("❓ Yordam")],
+        [KeyboardButton("📋 Guruhlarim"), KeyboardButton("▶️ Start")],
+        [KeyboardButton("⏸ Stop"), KeyboardButton("🚀 Test yuborish")],
+        [KeyboardButton("❓ Yordam")],
     ]
     if is_founder:
         rows.append([KeyboardButton("👑 Founder panel")])
@@ -436,23 +487,12 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- state: announce kutilmoqda (founder) ---
     if state == "wait_announce":
+        if not founder:
+            context.user_data["state"] = None
+            await update.message.reply_text("⛔ Faqat founder uchun.", reply_markup=main_menu_kb(founder))
+            return
         context.user_data["state"] = None
-        con = db(); cur = con.cursor()
-        cur.execute("SELECT user_id FROM users WHERE is_banned=0")
-        users = [r["user_id"] for r in cur.fetchall()]; con.close()
-        ok = 0
-        for uid in users:
-            try:
-                await context.bot.send_message(uid, f"📢 <b>Founder xabari:</b>\n\n{text}", parse_mode="HTML")
-                ok += 1
-            except RetryAfter as e:
-                try:
-                    await asyncio.sleep(e.retry_after + 1)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            await asyncio.sleep(0.05)
+        ok = await send_announce_to_all(text, context)
         await update.message.reply_text(f"✅ Announce {ok} userga yuborildi.", reply_markup=main_menu_kb(founder))
         return
 
@@ -492,6 +532,15 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"🚀 Test yakuni: ✅ {ok} | ❌ {fail}")
     elif text == "❓ Yordam":
         await help_cmd(update, context)
+    elif text == "🌐 Web panel":
+        link = web_panel_url(user.id)
+        if link:
+            await update.message.reply_text(
+                f"🌐 <b>Web panel:</b>\n{link}\n\nBrauzerda oching — xabar, interval, guruhlar, Start/Stop hammasi shu yerda.",
+                parse_mode="HTML", reply_markup=main_menu_kb(founder))
+        else:
+            await update.message.reply_text("🌐 Web panel hali sozlanmagan. Admin WEB_URL ni qo'shishi kerak.",
+                                            reply_markup=main_menu_kb(founder))
     elif text == "👑 Founder panel":
         if not founder:
             await update.message.reply_text("⛔ Bu bo'lim faqat founder uchun.")
@@ -501,17 +550,56 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # noma'lum matn — agar broadcast yo'q bo'lsa xabar sifatida saqlab qo'yamizmi? Yo'q, menyuni ko'rsatamiz
         await update.message.reply_text("Menyudan tanlang 👇", reply_markup=main_menu_kb(founder))
 
+async def send_announce_to_all(text, context, from_chat_id=None, message_id=None):
+    """Announce: matn bo'lsa sendMessage, media bo'lsa copyMessage bilan."""
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT user_id FROM users WHERE is_banned=0")
+    users = [r["user_id"] for r in cur.fetchall()]; con.close()
+    ok = 0
+    for uid in users:
+        try:
+            if from_chat_id and message_id:
+                await context.bot.copy_message(chat_id=uid, from_chat_id=from_chat_id, message_id=message_id)
+            else:
+                await context.bot.send_message(uid, f"📢 <b>Founder xabari:</b>\n\n{text}", parse_mode="HTML")
+            ok += 1
+        except RetryAfter as e:
+            try:
+                await asyncio.sleep(e.retry_after + 1)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
+    return ok
+
 async def private_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # foto/video/doc va h.k. — xabar sifatida saqlash
+    # foto/video/doc va h.k. — faqat to'g'ri state da qabul qilinadi
     if update.effective_chat.type != "private":
         return
     user = update.effective_user
     founder = is_founder_check(user)
+    # ban tekshirish
+    u = get_user(user.id)
+    if u and u["is_banned"] and not founder:
+        await update.message.reply_text("⛔ Siz bloklangansiz.")
+        return
     state = context.user_data.get("state")
-    if state != "wait_message":
-        # agar user to'g'ridan-to'g'ri media tashlasa ham xabar sifatida qabul qilamiz (qulaylik)
-        pass
     msg = update.message
+    # Founder announce uchun media qabul qilamiz
+    if state == "wait_announce" and founder:
+        context.user_data["state"] = None
+        ok = await send_announce_to_all("", context,
+                                        from_chat_id=update.effective_chat.id,
+                                        message_id=msg.message_id)
+        await msg.reply_text(f"✅ Announce (media) {ok} userga yuborildi.",
+                             reply_markup=main_menu_kb(founder))
+        return
+    if state != "wait_message":
+        # XAVFSIZLIK: tasodifiy media eski broadcastni o'chirib yubormasligi uchun
+        await msg.reply_text("Avval 📝 Xabar yaratish ni bosing, keyin media yuboring.",
+                             reply_markup=main_menu_kb(founder))
+        return
     preview = msg.caption or msg.text or "[media xabar]"
     if len(preview) > 200:
         preview = preview[:200]
@@ -522,9 +610,15 @@ async def private_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    groups = get_all_groups()
+    founder = is_founder_check(update.effective_user)
+    # XAVFSIZLIK: faqat o'z egalik qilgan guruhlar ko'rsatiladi.
+    # Founder bo'lsa barcha guruhlarni ko'radi (admin nazorati uchun).
+    if founder:
+        groups = get_all_groups()
+    else:
+        groups = get_owned_groups(user_id)
     if not groups:
-        await update.message.reply_text("📭 Hali guruh topilmadi.\nBotni guruhga qo'shing va admin qiling, keyin qayta urinib ko'ring.")
+        await update.message.reply_text("📭 Hali guruh topilmadi.\nBotni guruhga o'zingiz qo'shing va admin qiling, keyin qayta urinib ko'ring.")
         return
     my = {g["chat_id"] for g in get_user_groups(user_id)}
     # inline tugmalar
@@ -535,7 +629,7 @@ async def show_my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb.append([InlineKeyboardButton(f"{mark} {title}", callback_data=f"t:{g['chat_id']}")])
     kb.append([InlineKeyboardButton("✅ Hammasini tanlash", callback_data="a:all"),
                InlineKeyboardButton("🧹 Tozalash", callback_data="a:none")])
-    await update.message.reply_text(f"📋 Guruhlar ({len(groups)} ta). Yuborish uchun tanlang:",
+    await update.message.reply_text(f"📋 Guruhlarim ({len(groups)} ta). Yuborish uchun tanlang:",
                                     reply_markup=InlineKeyboardMarkup(kb))
 
 async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -583,6 +677,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             gid = int(data[2:])
         except ValueError:
             return
+        # XAVFSIZLIK: begona guruhni toggle qilish taqiqlanadi (founder dan tashqari).
+        if not is_group_owner(user_id, gid, founder=founder):
+            await q.edit_message_text("⛔ Bu guruh sizniki emas. Botni o'z guruhingizga o'zingiz qo'shing.")
+            return
         con = db(); cur = con.cursor()
         _ex(cur, "SELECT * FROM user_groups WHERE user_id=? AND group_id=?", (user_id, gid))
         if cur.fetchone():
@@ -596,15 +694,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "a:all":
-        groups = get_user_groups(user_id)  # xavfsizlik: faqat o'ziga tegishli emas, barcha mavjuddan tanlashga ruxsat?
-        # To'g'risi: user o'zi qo'shgan guruhlarni tanlashi uchun barcha guruhlar ro'yxatidan tanlaydi,
-        # lekin bu yerda faqat mavjud guruhlarni biriktiramiz (o'z guruhlari + umumiy).
-        all_groups = get_all_groups()
+        # XAVFSIZLIK: faqat o'z egalik guruhlari tanlanadi.
+        # Founder bo'lsa barcha guruhlarni tanlay oladi.
+        if founder:
+            all_groups = get_all_groups()
+        else:
+            all_groups = get_owned_groups(user_id)
         con = db(); cur = con.cursor()
         for g in all_groups:
             _link_user_group(cur, user_id, g["chat_id"])
         con.commit(); con.close()
-        await q.edit_message_text(f"✅ Hamma guruhlar tanlandi ({len(all_groups)} ta).")
+        await q.edit_message_text(f"✅ Hamma o'z guruhlaringiz tanlandi ({len(all_groups)} ta).")
         return
     if data == "a:none":
         con = db(); cur = con.cursor()

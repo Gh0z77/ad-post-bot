@@ -13,3 +13,19 @@ services:
         sync: false
       - key: DATABASE_URL
         sync: false
+      - key: WEB_URL
+        sync: false
+  - type: web
+    name: avto-xabar-panel
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn webapp:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: FOUNDER_USERNAME
+        value: dior_coder
+      - key: ADMIN_IDS
+        sync: false
+      - key: DATABASE_URL
+        sync: false
