@@ -43,6 +43,33 @@ if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 WEB_URL = os.getenv("WEB_URL", "").rstrip("/")
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
+UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Web panel imzo kaliti: bo'sh bo'lsa BOT_TOKEN ishlatiladi (alohida SECRET tavsiya qilinadi)
+WEB_SECRET = os.getenv("WEB_SECRET", "").strip() or BOT_TOKEN
+
+def _bc_val(bc, key, default=""):
+    """sqlite.Row / RealDictRow / None uchun xavfsiz o'qish (eski DB da ustun bo'lmasligi mumkin)."""
+    if not bc:
+        return default
+    try:
+        v = bc[key]
+    except Exception:
+        return default
+    return v if v is not None else default
+
+def sign_uid(user_id: int) -> str:
+    import hmac as _hmac, hashlib as _hl
+    return _hmac.new(WEB_SECRET.encode(), str(user_id).encode(), _hl.sha256).hexdigest()[:32]
+
+def verify_uid_sig(user_id, sig) -> bool:
+    # WEB_SECRET sozlanmagan bo'lsa (BOT_TOKEN ham yo'q) — imzo talab qilinmaydi (backward compat)
+    if not WEB_SECRET:
+        return True
+    if not sig:
+        return False
+    import hmac as _hmac
+    return _hmac.compare_digest(sign_uid(int(user_id)), str(sig or "").lower())
 
 _pg_mods = {}
 if USE_PG:
@@ -109,15 +136,24 @@ def init_db():
         source_msg_id BIGINT,
         has_text INTEGER DEFAULT 0,
         preview TEXT,
+        web_text TEXT DEFAULT '',
+        web_media TEXT DEFAULT '',
         interval_min INTEGER DEFAULT 10,
         is_active INTEGER DEFAULT 0,
         last_sent TEXT
     )""")
-    # eski DB larda last_sent bo'lmasligi mumkin -> qo'shib qo'yamiz
+    cur.execute("""CREATE TABLE IF NOT EXISTS states(
+        user_id BIGINT PRIMARY KEY,
+        state TEXT
+    )""")
+    # eski DB larda ustunlar bo'lmasligi mumkin -> qo'shib qo'yamiz
     try:
         if USE_PG:
             cur.execute("ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS last_sent TEXT")
             cur.execute("ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS has_text INTEGER DEFAULT 0")
+            cur.execute("ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS web_text TEXT DEFAULT ''")
+            cur.execute("ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS web_media TEXT DEFAULT ''")
+            cur.execute("ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS preview TEXT DEFAULT ''")
         else:
             cur.execute("PRAGMA table_info(broadcasts)")
             cols = {r[1] for r in cur.fetchall()}
@@ -125,6 +161,12 @@ def init_db():
                 cur.execute("ALTER TABLE broadcasts ADD COLUMN last_sent TEXT")
             if "has_text" not in cols:
                 cur.execute("ALTER TABLE broadcasts ADD COLUMN has_text INTEGER DEFAULT 0")
+            if "web_text" not in cols:
+                cur.execute("ALTER TABLE broadcasts ADD COLUMN web_text TEXT DEFAULT ''")
+            if "web_media" not in cols:
+                cur.execute("ALTER TABLE broadcasts ADD COLUMN web_media TEXT DEFAULT ''")
+            if "preview" not in cols:
+                cur.execute("ALTER TABLE broadcasts ADD COLUMN preview TEXT DEFAULT ''")
     except Exception:
         pass
     # Migratsiya: eski DB da egalik user_groups da aralash saqlangan —
@@ -250,7 +292,12 @@ def get_user_groups(user_id):
 
 def get_all_groups(limit=100):
     con = db(); cur = con.cursor()
-    cur.execute("SELECT * FROM groups ORDER BY added_at DESC LIMIT %s" % (int(limit),))
+    # parametrli so'rov (SQL-injection himoyasi, limit int ga majburlanadi)
+    lim = max(1, min(int(limit), 500))
+    if USE_PG:
+        cur.execute("SELECT * FROM groups ORDER BY added_at DESC LIMIT %s", (lim,))
+    else:
+        cur.execute("SELECT * FROM groups ORDER BY added_at DESC LIMIT ?", (lim,))
     rows = cur.fetchall(); con.close()
     return rows
 
@@ -286,10 +333,46 @@ def set_active(user_id, active):
     _ex(cur, "UPDATE broadcasts SET is_active=? WHERE user_id=?", (1 if active else 0, user_id))
     con.commit(); con.close()
 
+def db_get_state(user_id):
+    """Restartga chidamli state (user_data RAM yo'qolsa ham DB dan tiklanadi)."""
+    try:
+        con = db(); cur = con.cursor()
+        _ex(cur, "SELECT state FROM states WHERE user_id=?", (user_id,))
+        r = cur.fetchone(); con.close()
+        return r["state"] if r else None
+    except Exception:
+        return None
+
+def db_set_state(user_id, state):
+    try:
+        con = db(); cur = con.cursor()
+        if state is None:
+            _ex(cur, "DELETE FROM states WHERE user_id=?", (user_id,))
+        else:
+            if USE_PG:
+                cur.execute("INSERT INTO states(user_id,state) VALUES(%s,%s) "
+                            "ON CONFLICT(user_id) DO UPDATE SET state=EXCLUDED.state", (user_id, state))
+            else:
+                cur.execute("INSERT OR REPLACE INTO states(user_id,state) VALUES(?,?)", (user_id, state))
+        con.commit(); con.close()
+    except Exception:
+        pass
+
+def get_state_both(user_id, context):
+    s = (context.user_data or {}).get("state")
+    return s or db_get_state(user_id)
+
+def set_state_both(user_id, context, state):
+    try:
+        context.user_data["state"] = state
+    except Exception:
+        pass
+    db_set_state(user_id, state)
+
 # ============ KEYBOARDS ============
 def web_panel_url(user_id):
     if WEB_URL:
-        return f"{WEB_URL}/dash?uid={user_id}"
+        return f"{WEB_URL}/dash?uid={user_id}&sig={sign_uid(user_id)}"
     return None
 
 def main_menu_kb(is_founder=False):
@@ -317,7 +400,13 @@ def founder_kb():
 # ============ BROADCAST JOB ============
 async def do_broadcast_to_user(user_id: int, context: ContextTypes.DEFAULT_TYPE, reason=""):
     bc = get_broadcast(user_id)
-    if not bc or not bc["source_msg_id"]:
+    if not bc:
+        return 0, 0, "Xabar topilmadi"
+    web_text = str(_bc_val(bc, "web_text", "") or "").strip()
+    web_media = str(_bc_val(bc, "web_media", "") or "").strip()
+    has_copy = bool(bc["source_msg_id"])
+    has_web = bool(web_text or web_media)
+    if not has_copy and not has_web:
         return 0, 0, "Xabar topilmadi"
     groups = get_user_groups(user_id)
     if not groups:
@@ -325,11 +414,34 @@ async def do_broadcast_to_user(user_id: int, context: ContextTypes.DEFAULT_TYPE,
     ok = fail = 0
     for g in groups:
         try:
-            await context.bot.copy_message(
-                chat_id=g["chat_id"],
-                from_chat_id=bc["source_chat_id"],
-                message_id=bc["source_msg_id"],
-            )
+            if has_web:
+                # Web panelda yozilgan xabar ustun turadi (bot lichkasidagi copy ga nisbatan)
+                if web_media:
+                    fpath = os.path.join(UPLOAD_DIR, os.path.basename(web_media))
+                    ext = web_media.rsplit(".", 1)[-1].lower() if "." in web_media else ""
+                    if os.path.exists(fpath):
+                        with open(fpath, "rb") as f:
+                            if ext in ("png", "jpg", "jpeg", "gif"):
+                                await context.bot.send_photo(chat_id=g["chat_id"], photo=f,
+                                                             caption=web_text[:1024] or None)
+                            elif ext == "mp4":
+                                await context.bot.send_video(chat_id=g["chat_id"], video=f,
+                                                             caption=web_text[:1024] or None)
+                            else:
+                                await context.bot.send_document(chat_id=g["chat_id"], document=f,
+                                                                caption=web_text[:1024] or None)
+                    else:
+                        # fayl topilmasa (masalan web alohida serverda) — matnni yuboramiz
+                        await context.bot.send_message(chat_id=g["chat_id"],
+                                                       text=web_text or "(media topilmadi)")
+                else:
+                    await context.bot.send_message(chat_id=g["chat_id"], text=web_text)
+            else:
+                await context.bot.copy_message(
+                    chat_id=g["chat_id"],
+                    from_chat_id=bc["source_chat_id"],
+                    message_id=bc["source_msg_id"],
+                )
             ok += 1
         except RetryAfter as e:
             fail += 1
@@ -416,7 +528,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"5️⃣ <b>▶️ Start</b> ni bosing — har N daqiqada avtomatik yuboraman.",
         reply_markup=main_menu_kb(founder),
     )
-    context.user_data["state"] = None
+    set_state_both(user.id, context, None)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -462,7 +574,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     founder = is_founder_check(user)
     text = (update.message.text or "").strip()
-    state = context.user_data.get("state")
+    state = get_state_both(user.id, context)
 
     # ban
     u = get_user(user.id)
@@ -478,7 +590,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ 1 dan 10080 gacha (1 hafta) son kiriting.")
                 return
             set_interval(user.id, mins)
-            context.user_data["state"] = None
+            set_state_both(user.id, context, None)
             await update.message.reply_text(f"✅ Interval saqlandi: har <b>{mins} daqiqada</b>. Endi ▶️ Start ni bosing.",
                                             parse_mode="HTML", reply_markup=main_menu_kb(founder))
         except ValueError:
@@ -488,10 +600,10 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- state: announce kutilmoqda (founder) ---
     if state == "wait_announce":
         if not founder:
-            context.user_data["state"] = None
+            set_state_both(user.id, context, None)
             await update.message.reply_text("⛔ Faqat founder uchun.", reply_markup=main_menu_kb(founder))
             return
-        context.user_data["state"] = None
+        set_state_both(user.id, context, None)
         ok = await send_announce_to_all(text, context)
         await update.message.reply_text(f"✅ Announce {ok} userga yuborildi.", reply_markup=main_menu_kb(founder))
         return
@@ -500,17 +612,17 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == "wait_message":
         preview = text[:200]
         save_broadcast_msg(user.id, update.effective_chat.id, update.message.message_id, preview, has_text=1)
-        context.user_data["state"] = None
+        set_state_both(user.id, context, None)
         await update.message.reply_text("✅ Xabar saqlandi!\n\nEndi ⏱ Interval belgilang, keyin ▶️ Start ni bosing.",
                                         reply_markup=main_menu_kb(founder))
         return
 
     # --- menyu tugmalari ---
     if text == "📝 Xabar yaratish":
-        context.user_data["state"] = "wait_message"
+        set_state_both(user.id, context, "wait_message")
         await update.message.reply_text("✍️ Yuboriladigan xabarni shu yerga tashlang.\nMatn, foto, video, dokument — hammasini qabul qilaman.")
     elif text == "⏱ Interval":
-        context.user_data["state"] = "wait_interval"
+        set_state_both(user.id, context, "wait_interval")
         bc = get_broadcast(user.id)
         cur_iv = bc["interval_min"] if bc else 10
         await update.message.reply_text(f"Hozirgi interval: <b>{cur_iv} daqiqa</b>.\nYangi intervalni daqiqada yuboring (masalan: 5, 10, 30):", parse_mode="HTML")
@@ -584,11 +696,11 @@ async def private_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if u and u["is_banned"] and not founder:
         await update.message.reply_text("⛔ Siz bloklangansiz.")
         return
-    state = context.user_data.get("state")
+    state = get_state_both(user.id, context)
     msg = update.message
     # Founder announce uchun media qabul qilamiz
     if state == "wait_announce" and founder:
-        context.user_data["state"] = None
+        set_state_both(user.id, context, None)
         ok = await send_announce_to_all("", context,
                                         from_chat_id=update.effective_chat.id,
                                         message_id=msg.message_id)
@@ -604,7 +716,7 @@ async def private_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(preview) > 200:
         preview = preview[:200]
     save_broadcast_msg(user.id, update.effective_chat.id, msg.message_id, preview, has_text=0)
-    context.user_data["state"] = None
+    set_state_both(user.id, context, None)
     await msg.reply_text("✅ Xabar (media) saqlandi! Endi ⏱ Interval belgilang va ▶️ Start ni bosing.",
                          reply_markup=main_menu_kb(founder))
 
@@ -637,21 +749,25 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     founder = is_founder_check(update.effective_user)
     bc = get_broadcast(user_id)
     groups = get_user_groups(user_id)
-    if not bc or not bc["source_msg_id"]:
+    _has = bool(bc and (bc["source_msg_id"] or str(_bc_val(bc, "web_text", "")).strip()
+                        or str(_bc_val(bc, "web_media", "")).strip()))
+    if not _has:
         await update.message.reply_text("📊 Status: xabar hali yaratilmagan.", reply_markup=main_menu_kb(founder))
         return
     active = "🟢 Faol" if bc["is_active"] else "🔴 To'xtatilgan"
     jobs = "yoqilgan" if context.application.job_queue.get_jobs_by_name(f"bc_{user_id}") else "o'chirilgan"
     await update.message.reply_text(
         f"📊 <b>Status</b>\n{active} (job: {jobs})\n⏱ Har {bc['interval_min']} daqiqada\n"
-        f"📋 Guruhlar: {len(groups)} ta\n📝 Xabar: {bc['preview'] or 'media'}",
+        f"📋 Guruhlar: {len(groups)} ta\n📝 Xabar: {bc['preview'] or _bc_val(bc, 'web_text', '')[:80] or 'media'}",
         parse_mode="HTML", reply_markup=main_menu_kb(founder))
 
 async def start_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     founder = is_founder_check(update.effective_user)
     bc = get_broadcast(user_id)
-    if not bc or not bc["source_msg_id"]:
+    _has = bool(bc and (bc["source_msg_id"] or str(_bc_val(bc, "web_text", "")).strip()
+                        or str(_bc_val(bc, "web_media", "")).strip()))
+    if not _has:
         await update.message.reply_text("❌ Avval 📝 Xabar yaratish orqali xabar yuboring.", reply_markup=main_menu_kb(founder))
         return
     groups = get_user_groups(user_id)
@@ -764,7 +880,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(f"{'🚫 Ban qilindi' if new_ban else '✅ Ban olindi'}: {uid}", reply_markup=founder_kb())
         con.close()
     elif data == "f:announce":
-        context.user_data["state"] = "wait_announce"
+        set_state_both(user_id, context, "wait_announce")
         await q.edit_message_text("📢 Announce matnini yuboring (hamma userga boradi).")
     elif data == "f:stopall":
         con = db(); cur = con.cursor()

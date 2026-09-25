@@ -8,6 +8,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 USE_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+IS_EPHEMERAL = bool(IS_VERCEL and not USE_PG)
 
 if IS_VERCEL and not USE_PG:
     # Vercel'da filesystem ephemeral (/tmp dan tashqari yozib bo'lmaydi).
@@ -66,6 +67,7 @@ def init_db():
     cur.execute("""CREATE TABLE IF NOT EXISTS broadcasts(
         user_id BIGINT PRIMARY KEY, source_chat_id BIGINT, source_msg_id BIGINT,
         preview TEXT, has_text INTEGER DEFAULT 0,
+        web_text TEXT DEFAULT '', web_media TEXT DEFAULT '',
         interval_min INTEGER DEFAULT 10, is_active INTEGER DEFAULT 0,
         last_sent TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS states(
@@ -74,6 +76,9 @@ def init_db():
         if USE_PG:
             cur.execute("ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS has_text INTEGER DEFAULT 0")
             cur.execute("ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS last_sent TEXT")
+            cur.execute("ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS web_text TEXT DEFAULT ''")
+            cur.execute("ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS web_media TEXT DEFAULT ''")
+            cur.execute("ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS preview TEXT DEFAULT ''")
         else:
             cur.execute("PRAGMA table_info(broadcasts)")
             cols = {r[1] for r in cur.fetchall()}
@@ -81,6 +86,12 @@ def init_db():
                 cur.execute("ALTER TABLE broadcasts ADD COLUMN has_text INTEGER DEFAULT 0")
             if "last_sent" not in cols:
                 cur.execute("ALTER TABLE broadcasts ADD COLUMN last_sent TEXT")
+            if "web_text" not in cols:
+                cur.execute("ALTER TABLE broadcasts ADD COLUMN web_text TEXT DEFAULT ''")
+            if "web_media" not in cols:
+                cur.execute("ALTER TABLE broadcasts ADD COLUMN web_media TEXT DEFAULT ''")
+            if "preview" not in cols:
+                cur.execute("ALTER TABLE broadcasts ADD COLUMN preview TEXT DEFAULT ''")
     except Exception:
         pass
     # Migratsiya: eski user_groups dagi egalikni group_owners ga ko'chirish
@@ -160,3 +171,33 @@ def set_state(uid, state):
 
 def is_founder_id(uid):
     return uid in ADMIN_IDS
+
+
+def bc_val(bc, key, default=""):
+    """sqlite.Row / RealDictRow uchun xavfsiz o'qish (eski DB da ustun bo'lmasa default)."""
+    if not bc:
+        return default
+    try:
+        v = bc[key]
+    except Exception:
+        return default
+    return v if v is not None else default
+
+
+def web_secret():
+    import os as _os
+    return _os.getenv("WEB_SECRET", "").strip() or _os.getenv("BOT_TOKEN", "").strip()
+
+
+def sign_uid(uid) -> str:
+    import hmac as _hmac, hashlib as _hl
+    return _hmac.new(web_secret().encode(), str(uid).encode(), _hl.sha256).hexdigest()[:32]
+
+
+def verify_uid_sig(uid, sig) -> bool:
+    if not web_secret():
+        return True
+    if not sig:
+        return False
+    import hmac as _hmac
+    return _hmac.compare_digest(sign_uid(uid), str(sig or "").lower())

@@ -58,11 +58,21 @@ def do_broadcast(uid):
                    WHERE ug.user_id=?""", (uid,))
     groups = cur.fetchall()
     con.close()
-    if not bc or not bc["source_msg_id"] or not groups:
+    if not bc or not groups:
+        return 0, 0
+    web_text = str(S.bc_val(bc, "web_text", "") or "").strip()
+    # Vercel'da uploads fayllari yo'q (ephemeral) — web_media ni yuborib bo'lmaydi,
+    # shuning uchun web_text ustun, aks holda copy ishlatiladi.
+    has_copy = bool(bc["source_msg_id"])
+    has_web = bool(web_text)
+    if not has_copy and not has_web:
         return 0, 0
     ok = fail = 0
     for g in groups:
-        r = T.copy_message(g["chat_id"], bc["source_chat_id"], bc["source_msg_id"])
+        if has_web:
+            r = T.send_message(g["chat_id"], web_text)
+        else:
+            r = T.copy_message(g["chat_id"], bc["source_chat_id"], bc["source_msg_id"])
         if r.get("ok"):
             ok += 1
         else:
@@ -350,10 +360,16 @@ def handle(update):
         return
 
     if text == "/start":
+        _warn = ""
+        if S.IS_EPHEMERAL:
+            _warn = ("\n\n⚠️ <b>DIQQAT:</b> Vercel da <code>DATABASE_URL</code> o'rnatilmagan! "
+                     "Hozir bot vaqtincha xotirada ishlayapti — xabar/guruh saqlanmaydi va cron yubormaydi. "
+                     "Neon Postgres URL ni Vercel Env ga qo'shing.")
         T.send_message(uid,
             f"Assalomu alaykum, {tu.get('first_name','')}!\n"
             f"{'👑 <b>Founder</b>' if founder else '👤 Foydalanuvchi'} sifatida kirdingiz.\n\n"
-            "1️⃣ Meni guruhga qo'shing (admin).\n2️⃣ 📝 Xabar yaratish\n3️⃣ ⏱ Interval\n4️⃣ 📋 Guruhlarim → tanlash\n5️⃣ ▶️ Start",
+            "1️⃣ Meni guruhga qo'shing (admin).\n2️⃣ 📝 Xabar yaratish\n3️⃣ ⏱ Interval\n4️⃣ 📋 Guruhlarim → tanlash\n5️⃣ ▶️ Start"
+            f"{_warn}",
             reply_markup=T.main_menu(founder))
     elif text == "📝 Xabar yaratish":
         S.set_state(uid, "wait_message")
@@ -369,11 +385,14 @@ def handle(update):
         con = S.db(); cur = con.cursor()
         S._ex(cur, "SELECT * FROM broadcasts WHERE user_id=?", (uid,))
         bc = cur.fetchone()
-        if not bc or not bc["source_msg_id"]:
+        _has = bool(bc and (bc["source_msg_id"] or str(S.bc_val(bc, "web_text", "")).strip()
+                            or str(S.bc_val(bc, "web_media", "")).strip()))
+        if not _has:
             T.send_message(uid, "❌ Avval 📝 Xabar yaratish.")
         else:
-            S._ex(cur, "UPDATE broadcasts SET is_active=1, last_sent=? WHERE user_id=?",
-                  (datetime.now().isoformat(timespec="seconds"), uid))
+            # last_sent=NULL -> cron keyingi tick da darhol yuboradi (bot.py first=5s bilan bir xil)
+            S._ex(cur, "UPDATE broadcasts SET is_active=1, last_sent=NULL WHERE user_id=?",
+                  (uid,))
             T.send_message(uid, f"▶️ Boshladim! Har {bc['interval_min']} daqiqada yuboraman (Vercel cron orqali).",
                            reply_markup=T.main_menu(founder))
         con.commit(); con.close()
@@ -383,8 +402,13 @@ def handle(update):
         con.commit(); con.close()
         T.send_message(uid, "⏸ To'xtatildi.", reply_markup=T.main_menu(founder))
     elif text == "🚀 Test yuborish":
+        if S.IS_EPHEMERAL:
+            T.send_message(uid, "⚠️ DATABASE_URL yo'q — Vercel da saqlash vaqtincha, Test ishonchli emas. Avval Postgres ulang.")
         ok, fail = do_broadcast(uid)
-        T.send_message(uid, f"🚀 Test: ✅ {ok} | ❌ {fail}")
+        _extra = ""
+        if ok == 0 and fail == 0:
+            _extra = " (xabar yoki tanlangan guruh yo'q — 📝 Xabar va 📋 Guruhlarim ni tekshiring)"
+        T.send_message(uid, f"🚀 Test: ✅ {ok} | ❌ {fail}{_extra}")
     elif text == "📊 Status":
         con = S.db(); cur = con.cursor()
         S._ex(cur, "SELECT * FROM broadcasts WHERE user_id=?", (uid,))
@@ -392,10 +416,13 @@ def handle(update):
         S._ex(cur, "SELECT COUNT(*) c FROM user_groups WHERE user_id=?", (uid,))
         gc = cur.fetchone()["c"]
         con.close()
-        if not bc or not bc["source_msg_id"]:
-            T.send_message(uid, "📊 Xabar hali yaratilmagan.", reply_markup=T.main_menu(founder))
+        _has = bool(bc and (bc["source_msg_id"] or str(S.bc_val(bc, "web_text", "")).strip()
+                            or str(S.bc_val(bc, "web_media", "")).strip()))
+        if not _has:
+            T.send_message(uid, "📊 Xabar hali yaratilmagan." + (" ⚠️ DATABASE_URL yo'q — saqlanmaydi!" if S.IS_EPHEMERAL else ""), reply_markup=T.main_menu(founder))
         else:
-            T.send_message(uid, f"📊 {'🟢 Faol' if bc['is_active'] else '🔴 Stop'} | Har {bc['interval_min']} min | Guruh: {gc}",
+            _ep = " ⚠️ (DATABASE_URL yo'q — cron ishlamaydi!)" if S.IS_EPHEMERAL else ""
+            T.send_message(uid, f"📊 {'🟢 Faol' if bc['is_active'] else '🔴 Stop'} | Har {bc['interval_min']} min | Guruh: {gc}{_ep}",
                            reply_markup=T.main_menu(founder))
     elif text == "📋 Guruhlarim":
         # XAVFSIZLIK: faqat o'z egalik guruhlari (founder bo'lsa hammasi)
@@ -430,8 +457,9 @@ def handle(update):
         T.send_message(uid, "Botni guruhga admin qiling → 📝 Xabar → ⏱ Interval → 📋 Guruhlarim → ▶️ Start.\nVercel'da yuborish har daqiqalik cron orqali ishlaydi.")
     elif text == "🌐 Web panel":
         import os as _os
-        _web = (_os.getenv("WEB_URL", "").rstrip("/") + f"/dash?uid={uid}") if _os.getenv("WEB_URL") else ""
-        if _web:
+        _base = _os.getenv("WEB_URL", "").rstrip("/")
+        if _base:
+            _web = f"{_base}/dash?uid={uid}&sig={S.sign_uid(uid)}"
             T.send_message(uid, f"🌐 <b>Web panel:</b>\n{_web}\n\nBrauzerda oching — hamma funksiya shu yerda.",
                            reply_markup=T.main_menu(founder))
         else:
@@ -453,7 +481,7 @@ def run_due_broadcasts():
         from datetime import timedelta
         S.init_db()
         con = S.db(); cur = con.cursor()
-        cur.execute("SELECT * FROM broadcasts WHERE is_active=1 AND source_msg_id IS NOT NULL")
+        cur.execute("SELECT * FROM broadcasts WHERE is_active=1")
         rows = cur.fetchall()
         con.close()
         sent = 0
@@ -469,14 +497,22 @@ def run_due_broadcasts():
                     due = True
             if not due:
                 continue
+            # web_text bo'lsa copy shart emas (serverless uploads siz)
+            has = bool(bc["source_msg_id"] or str(S.bc_val(bc, "web_text", "")).strip())
+            if not has:
+                continue
             uid = bc["user_id"]
             con2 = S.db(); cur2 = con2.cursor()
             S._ex(cur2, """SELECT g.chat_id FROM user_groups ug JOIN groups g ON g.chat_id=ug.group_id
                             WHERE ug.user_id=?""", (uid,))
             groups = cur2.fetchall()
             con2.close()
+            web_text = str(S.bc_val(bc, "web_text", "") or "").strip()
             for g in groups:
-                r = T.copy_message(g["chat_id"], bc["source_chat_id"], bc["source_msg_id"])
+                if web_text:
+                    r = T.send_message(g["chat_id"], web_text)
+                else:
+                    r = T.copy_message(g["chat_id"], bc["source_chat_id"], bc["source_msg_id"])
                 if not r.get("ok"):
                     desc = str(r).lower()
                     if "not found" in desc or "deleted" in desc or "kicked" in desc:

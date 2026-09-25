@@ -30,8 +30,14 @@ class handler(BaseHTTPRequestHandler):
             pass
         try:
             S.init_db()
+            if S.IS_EPHEMERAL:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok":false,"sent":0,"error":"ephemeral db: set DATABASE_URL (Neon/Supabase) in Vercel Env"}')
+                return
             con = S.db(); cur = con.cursor()
-            cur.execute("SELECT * FROM broadcasts WHERE is_active=1 AND source_msg_id IS NOT NULL")
+            cur.execute("SELECT * FROM broadcasts WHERE is_active=1")
             rows = cur.fetchall()
             con.close()
             sent = 0
@@ -47,14 +53,20 @@ class handler(BaseHTTPRequestHandler):
                         due = True
                 if not due:
                     continue
+                if not (bc["source_msg_id"] or str(S.bc_val(bc, "web_text", "")).strip()):
+                    continue
                 uid = bc["user_id"]
                 con2 = S.db(); cur2 = con2.cursor()
                 S._ex(cur2, """SELECT g.chat_id FROM user_groups ug JOIN groups g ON g.chat_id=ug.group_id
                                 WHERE ug.user_id=?""", (uid,))
                 groups = cur2.fetchall()
                 con2.close()
+                web_text = str(S.bc_val(bc, "web_text", "") or "").strip()
                 for g in groups:
-                    r = T.copy_message(g["chat_id"], bc["source_chat_id"], bc["source_msg_id"])
+                    if web_text:
+                        r = T.send_message(g["chat_id"], web_text)
+                    else:
+                        r = T.copy_message(g["chat_id"], bc["source_chat_id"], bc["source_msg_id"])
                     if not r.get("ok"):
                         desc = str(r).lower()
                         if "not found" in desc or "deleted" in desc or "kicked" in desc:

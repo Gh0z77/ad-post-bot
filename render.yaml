@@ -15,10 +15,13 @@ services:
         sync: false
       - key: WEB_URL
         sync: false
+      - key: WEB_SECRET
+        sync: false
   - type: web
     name: avto-xabar-panel
     runtime: python
     buildCommand: pip install -r requirements.txt
+    # workers=1 shart! Ko'paytirilsa scheduler dublikat yuboradi.
     startCommand: gunicorn webapp:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
     envVars:
       - key: BOT_TOKEN
@@ -29,3 +32,7 @@ services:
         sync: false
       - key: DATABASE_URL
         sync: false
+      - key: WEB_SECRET
+        sync: false
+      - key: ENABLE_SCHEDULER
+        value: 1

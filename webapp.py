@@ -41,6 +41,32 @@ DB_PATH = os.path.join(BASE_DIR, "bot.db")
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 WEB_URL = os.getenv("WEB_URL", "").rstrip("/")
+WEB_SECRET = os.getenv("WEB_SECRET", "").strip() or BOT_TOKEN
+
+def _bc_val(bc, key, default=""):
+    if not bc:
+        return default
+    try:
+        v = bc[key]
+    except Exception:
+        return default
+    return v if v is not None else default
+
+def sign_uid(uid) -> str:
+    import hmac as _hmac, hashlib as _hl
+    return _hmac.new(WEB_SECRET.encode(), str(uid).encode(), _hl.sha256).hexdigest()[:32]
+
+def verify_uid_sig(uid, sig) -> bool:
+    if not WEB_SECRET:
+        return True
+    if not sig:
+        # Eski imzosiz linklar: WEB_SECRET o'rnatilgan bo'lsa rad etamiz
+        return False
+    import hmac as _hmac
+    return _hmac.compare_digest(sign_uid(uid), str(sig or "").lower())
+
+def dash_url(uid):
+    return f"/dash?uid={uid}&sig={sign_uid(uid)}"
 
 _pg = {}
 if USE_PG:
@@ -78,7 +104,10 @@ def init_db():
     cur.execute("""CREATE TABLE IF NOT EXISTS broadcasts(
         user_id BIGINT PRIMARY KEY, source_chat_id BIGINT, source_msg_id BIGINT,
         preview TEXT, has_text INTEGER DEFAULT 0,
+        web_text TEXT DEFAULT '', web_media TEXT DEFAULT '',
         interval_min INTEGER DEFAULT 10, is_active INTEGER DEFAULT 0, last_sent TEXT)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS states(
+        user_id BIGINT PRIMARY KEY, state TEXT)""")
     # web uchun qo'shimcha ustunlar (migratsiya — xavfsiz)
     try:
         if USE_PG:
@@ -163,16 +192,16 @@ def send_broadcast_to_groups(uid):
     con.close()
     if not bc or not groups:
         return 0, 0, "Xabar yoki guruh yo'q"
-    has_copy = bool(bc["source_msg_id"])
-    has_web = bool((bc["web_text"] or "").strip() or (bc["web_media"] or "").strip())
+    has_copy = bool(_bc_val(bc, "source_msg_id", 0))
+    has_web = bool(_bc_val(bc, "web_text", "").strip() or _bc_val(bc, "web_media", "").strip())
     if not has_copy and not has_web:
         return 0, 0, "Xabar topilmadi"
     ok = fail = 0
     for g in groups:
         try:
             if has_web:
-                media = (bc["web_media"] or "").strip()
-                txt = (bc["web_text"] or "").strip()
+                media = _bc_val(bc, "web_media", "").strip()
+                txt = _bc_val(bc, "web_text", "").strip()
                 if media:
                     fpath = os.path.join(UPLOAD_DIR, os.path.basename(media))
                     ext = media.rsplit(".", 1)[-1].lower() if "." in media else ""
@@ -217,6 +246,10 @@ def send_broadcast_to_groups(uid):
     return ok, fail, ""
 
 def scheduler_loop():
+    # Gunicorn workers=1 bo'lishi shart (aks holda dublikat yuboradi).
+    # ENABLE_SCHEDULER=0 bo'lsa fon yuborish o'chadi (masalan alohida worker ishlatilsa).
+    if os.getenv("ENABLE_SCHEDULER", "1").strip() == "0":
+        return
     while True:
         try:
             con = db(); cur = con.cursor()
@@ -231,13 +264,13 @@ def scheduler_loop():
                         continue
                     iv = bc["interval_min"] or 10
                     due = True
-                    if bc["last_sent"]:
+                    if _bc_val(bc, "last_sent", ""):
                         try:
-                            due = now - datetime.fromisoformat(bc["last_sent"]) >= timedelta(minutes=iv)
+                            due = now - datetime.fromisoformat(_bc_val(bc, "last_sent", "")) >= timedelta(minutes=iv)
                         except Exception:
                             due = True
                     if due:
-                        has = bool(bc["source_msg_id"] or (bc["web_text"] or "").strip() or (bc["web_media"] or "").strip())
+                        has = bool(_bc_val(bc, "source_msg_id", 0) or _bc_val(bc, "web_text", "").strip() or _bc_val(bc, "web_media", "").strip())
                         if has:
                             send_broadcast_to_groups(uid)
                 except Exception:
@@ -261,21 +294,40 @@ a{color:#60a5fa}.top{display:flex;justify-content:space-between;align-items:cent
 small{color:#94a3b8}h1{font-size:24px}h2{font-size:18px;margin:6px 0}
 """
 
-def shell(title, body, uid=None):
+def shell(title, body, uid=None, sig=None):
     nav = ""
     if uid:
-        nav = f'<div class="top"><small>UID: <b>{uid}</b></small><span><a class="btn gray" href="/dash?uid={uid}">🏠 Panel</a> <a class="btn gray" href="/founder?uid={uid}">👑 Founder</a> <a class="btn gray" href="/">↩️ Chiqish</a></span></div>'
+        _sig = sig or (request.args.get("sig") or request.form.get("sig") or "")
+        nav = f'<div class="top"><small>UID: <b>{uid}</b></small><span><a class="btn gray" href="/dash?uid={uid}&sig={_sig}">🏠 Panel</a> <a class="btn gray" href="/founder?uid={uid}&sig={_sig}">👑 Founder</a> <a class="btn gray" href="/">↩️ Chiqish</a></span></div>'
     tok_warn = "" if BOT_TOKEN else '<div class="card" style="border-color:#dc2626">⚠️ <b>BOT_TOKEN topilmadi!</b> Render Environment ga BOT_TOKEN qo‘shing, aks holda yuborish ishlamaydi (sayt ochiladi, yuborish ishlamaydi).</div>'
+    db_warn = ""
+    if USE_PG is False and os.getenv("RENDER"):
+        db_warn = '<div class="card" style="border-color:#f59e0b">⚠️ <b>DATABASE_URL yo‘q:</b> Render da sqlite vaqtincha (redeploy da o‘chadi). Neon/Supabase Postgres qo‘shing.</div>'
     return f"""<!doctype html><html lang="uz"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title><style>{CSS}</style></head><body><div class="wrap">
-<h1>📢 Avto-Xabar Web Panel</h1>{nav}{tok_warn}{body}<small style="display:block;margin-top:20px">Bot bilan bir xil baza (bot.db / Postgres). Guruhga botni admin qilib qo‘shgan user avtomatik ko‘rinadi.</small></div></body></html>"""
+<h1>📢 Avto-Xabar Web Panel</h1>{nav}{tok_warn}{db_warn}{body}<small style="display:block;margin-top:20px">Bot bilan bir xil baza (bot.db / Postgres). Guruhga botni admin qilib qo‘shgan user avtomatik ko‘rinadi.</small></div></body></html>"""
 
-def need_uid():
+def need_uid(require_sig=True):
     uid = request.args.get("uid") or request.form.get("uid") or ""
     uid = str(uid).strip()
     if not uid.isdigit():
         return None
+    if require_sig and WEB_SECRET:
+        sig = request.args.get("sig") or request.form.get("sig") or ""
+        if not verify_uid_sig(int(uid), sig):
+            return None
     return int(uid)
+
+def need_uid_or_403(require_sig=True):
+    """need_uid + imzo xatosida 403 sahifa. (uid, sig, error_response) qaytaradi."""
+    uid_raw = request.args.get("uid") or request.form.get("uid") or ""
+    if not str(uid_raw).strip().isdigit():
+        return None, None, None
+    uid = int(str(uid_raw).strip())
+    sig = request.args.get("sig") or request.form.get("sig") or ""
+    if require_sig and WEB_SECRET and not verify_uid_sig(uid, sig):
+        return None, None, (shell("Taqiq", '<div class="card">⛔ Noto‘g‘ri yoki eskirgan link. Botdagi <b>🌐 Web panel</b> tugmasi orqali qayta kiring.</div>'), 403)
+    return uid, sig, None
 
 # ============ ROUTES ============
 @app.route("/")
@@ -297,7 +349,9 @@ def index():
 
 @app.route("/dash", methods=["GET"])
 def dash():
-    uid = need_uid()
+    uid, sig, err = need_uid_or_403()
+    if err:
+        return err
     if not uid:
         return redirect(url_for("index"))
     init_db()
@@ -310,7 +364,7 @@ def dash():
         con.commit(); con.close()
         u = get_user(uid)
     if u and u["is_banned"] and not is_founder_uid(uid):
-        return shell("Blok", '<div class="card">⛔ Siz bloklangansiz.</div>', uid)
+        return shell("Blok", '<div class="card">⛔ Siz bloklangansiz.</div>', uid, sig)
     founder = is_founder_uid(uid)
     con = db(); cur = con.cursor()
     _ex(cur, "SELECT * FROM broadcasts WHERE user_id=?", (uid,))
@@ -318,9 +372,9 @@ def dash():
     groups, sel = owned_groups(uid, founder)
     iv = bc["interval_min"] if bc else 10
     active = bool(bc and bc["is_active"])
-    preview = (bc["preview"] if bc and bc["preview"] else "") or ""
-    web_text = (bc["web_text"] if bc and "web_text" in bc.keys() else "") or ""
-    web_media = (bc["web_media"] if bc and "web_media" in bc.keys() else "") or ""
+    preview = _bc_val(bc, "preview", "")
+    web_text = _bc_val(bc, "web_text", "")
+    web_media = _bc_val(bc, "web_media", "")
     if not web_text and preview and not (bc and bc["source_msg_id"]):
         web_text = preview
     ghtml = ""
@@ -340,28 +394,30 @@ def dash():
 <p><small>⏱ Har <b>{iv} daqiqada</b> • 📋 Tanlangan: <b>{len(sel)} ta</b> • Xabar: {preview[:80] or web_text[:80] or '—'}</small></p>
 <p id="msg"></p></div>
 <div class="card"><h2>📝 Xabar yaratish</h2>
-<form action="/api/message?uid={uid}" method="post" enctype="multipart/form-data">
+<form action="/api/message?uid={uid}&sig={sig}" method="post" enctype="multipart/form-data">
 <label>Matn</label><textarea name="text" rows="4" placeholder="Reklama matni...">{web_text}</textarea>
 <label>Rasm/Video/File (ixtiyoriy, 20MB gacha)</label><input type="file" name="media">
 {media_html}
 <button class="btn" type="submit">💾 Saqlash</button></form>
 <p><small>Izoh: bot lichkasida yaratilgan xabar bo‘lsa — web uni ham yuboradi (copy orqali). Web da yozsangiz — web matni ustun turadi.</small></p></div>
 <div class="card"><h2>⏱ Interval (daqiqa)</h2>
-<form action="/api/interval?uid={uid}" method="post">
+<form action="/api/interval?uid={uid}&sig={sig}" method="post">
 <input name="minutes" type="number" min="1" max="10080" value="{iv}"><button class="btn" type="submit">Saqlash</button></form></div>
 <div class="card"><h2>📋 Guruhlarim ({len(groups)} ta)</h2>{ghtml}
 <div><button class="btn gray" onclick="act('select_all')">✅ Hammasini tanlash</button>
 <button class="btn gray" onclick="act('clear')">🧹 Tozalash</button></div></div>
 <script>
-const UID={uid};
-function act(a){{fetch('/api/'+a+'?uid='+UID,{{method:'POST'}}).then(r=>r.json()).then(j=>{{document.getElementById('msg').innerText=j.msg||JSON.stringify(j);setTimeout(()=>location.reload(),800);}});}}
-function toggleG(gid,on){{fetch('/api/toggle?uid='+UID+'&gid='+gid+'&on='+(on?1:0),{{method:'POST'}}).then(r=>r.json()).then(j=>{{document.getElementById('msg').innerText=j.msg;}});}}
+const UID={uid}; const SIG="{sig}";
+function act(a){{fetch('/api/'+a+'?uid='+UID+'&sig='+SIG,{{method:'POST'}}).then(r=>r.json()).then(j=>{{document.getElementById('msg').innerText=j.msg||JSON.stringify(j);setTimeout(()=>location.reload(),800);}});}}
+function toggleG(gid,on){{fetch('/api/toggle?uid='+UID+'&sig='+SIG+'&gid='+gid+'&on='+(on?1:0),{{method:'POST'}}).then(r=>r.json()).then(j=>{{document.getElementById('msg').innerText=j.msg;}});}}
 </script>"""
-    return shell("Panel", body, uid)
+    return shell("Panel", body, uid, sig)
 
 @app.route("/api/message", methods=["POST"])
 def api_message():
-    uid = need_uid()
+    uid, sig, err = need_uid_or_403()
+    if err:
+        return err
     if not uid:
         return jsonify({"ok": False}), 400
     init_db()
@@ -384,21 +440,25 @@ def api_message():
         if media:
             _ex(cur, "UPDATE broadcasts SET web_media=?, preview=? WHERE user_id=?", (media, preview, uid))
         if not text and not media:
-            con.close(); return redirect(f"/dash?uid={uid}")
+            con.close(); return redirect(f"/dash?uid={uid}&sig={sig}")
     else:
         _ex(cur, "INSERT INTO broadcasts(user_id,preview,web_text,web_media,interval_min,is_active) VALUES(?,?,?,?,10,0)",
             (uid, preview, text, media))
     con.commit(); con.close()
-    return redirect(f"/dash?uid={uid}")
+    return redirect(f"/dash?uid={uid}&sig={sig}")
 
 @app.route("/api/interval", methods=["POST"])
 def api_interval():
-    uid = need_uid()
+    uid, sig, err = need_uid_or_403()
+    if err:
+        return err
+    if not uid:
+        return redirect(url_for("index"))
     try:
         mins = int((request.form.get("minutes") or "10").split()[0])
         assert 1 <= mins <= 10080
     except Exception:
-        return "1-10080 oralig'ida son kiriting. <a href='/dash?uid=%s'>Orqaga</a>" % uid, 400
+        return "1-10080 oralig'ida son kiriting. <a href='/dash?uid=%s&sig=%s'>Orqaga</a>" % (uid, sig), 400
     con = db(); cur = con.cursor()
     _ex(cur, "SELECT * FROM broadcasts WHERE user_id=?", (uid,))
     if cur.fetchone():
@@ -406,7 +466,7 @@ def api_interval():
     else:
         _ex(cur, "INSERT INTO broadcasts(user_id,interval_min,is_active) VALUES(?,?,0)", (uid, mins))
     con.commit(); con.close()
-    return redirect(f"/dash?uid={uid}")
+    return redirect(f"/dash?uid={uid}&sig={sig}")
 
 def _is_owner_check(uid, gid, founder):
     if founder:
@@ -418,7 +478,11 @@ def _is_owner_check(uid, gid, founder):
 
 @app.route("/api/toggle", methods=["POST"])
 def api_toggle():
-    uid = need_uid()
+    uid, sig, err = need_uid_or_403()
+    if err:
+        return err
+    if not uid:
+        return jsonify({"ok": False})
     try:
         gid = int(request.args.get("gid")); on = request.args.get("on") == "1"
     except Exception:
@@ -440,7 +504,11 @@ def api_toggle():
 
 @app.route("/api/select_all", methods=["POST"])
 def api_select_all():
-    uid = need_uid()
+    uid, sig, err = need_uid_or_403()
+    if err:
+        return err
+    if not uid:
+        return jsonify({"ok": False})
     founder = is_founder_uid(uid)
     rows, _ = owned_groups(uid, founder)
     con = db(); cur = con.cursor()
@@ -454,7 +522,11 @@ def api_select_all():
 
 @app.route("/api/clear", methods=["POST"])
 def api_clear():
-    uid = need_uid()
+    uid, sig, err = need_uid_or_403()
+    if err:
+        return err
+    if not uid:
+        return jsonify({"ok": False})
     con = db(); cur = con.cursor()
     _ex(cur, "DELETE FROM user_groups WHERE user_id=?", (uid,))
     con.commit(); con.close()
@@ -462,23 +534,32 @@ def api_clear():
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
-    uid = need_uid()
+    uid, sig, err = need_uid_or_403()
+    if err:
+        return err
+    if not uid:
+        return jsonify({"ok": False})
     con = db(); cur = con.cursor()
     _ex(cur, "SELECT * FROM broadcasts WHERE user_id=?", (uid,))
     bc = cur.fetchone()
-    if not bc or not (bc["source_msg_id"] or (bc["web_text"] or "").strip() or (bc["web_media"] or "").strip()):
+    if not bc or not (bc["source_msg_id"] or _bc_val(bc, "web_text", "").strip() or _bc_val(bc, "web_media", "").strip()):
         con.close(); return jsonify({"ok": False, "msg": "❌ Avval xabar yarating"})
     _ex(cur, "SELECT COUNT(*) c FROM user_groups WHERE user_id=?", (uid,))
     if cur.fetchone()["c"] == 0:
         con.close(); return jsonify({"ok": False, "msg": "❌ Guruh tanlanmagan"})
-    _ex(cur, "UPDATE broadcasts SET is_active=1, last_sent=? WHERE user_id=?",
-        (datetime.now().isoformat(timespec="seconds"), uid))
+    # last_sent=NULL -> scheduler keyingi tick da darhol yuboradi (bot.py first=5s bilan bir xil mantiq)
+    _ex(cur, "UPDATE broadcasts SET is_active=1, last_sent=NULL WHERE user_id=?",
+        (uid,))
     con.commit(); con.close()
     return jsonify({"ok": True, "msg": "▶️ Boshladim!"})
 
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
-    uid = need_uid()
+    uid, sig, err = need_uid_or_403()
+    if err:
+        return err
+    if not uid:
+        return jsonify({"ok": False})
     con = db(); cur = con.cursor()
     _ex(cur, "UPDATE broadcasts SET is_active=0 WHERE user_id=?", (uid,))
     con.commit(); con.close()
@@ -486,7 +567,11 @@ def api_stop():
 
 @app.route("/api/test", methods=["POST"])
 def api_test():
-    uid = need_uid()
+    uid, sig, err = need_uid_or_403()
+    if err:
+        return err
+    if not uid:
+        return jsonify({"ok": False})
     ok, fail, msg = send_broadcast_to_groups(uid)
     if msg:
         return jsonify({"ok": False, "msg": "❌ " + msg})
@@ -496,15 +581,19 @@ def api_test():
 def founder_required(fn):
     @wraps(fn)
     def w(*a, **kw):
-        uid = need_uid()
+        uid, sig, err = need_uid_or_403()
+        if err:
+            return err
         if not uid or not is_founder_uid(uid):
             return shell("Taqiq", '<div class="card">⛔ Faqat founder uchun. <a href="/">Bosh sahifa</a></div>'), 403
+        request._auth_sig = sig
         return fn(uid, *a, **kw)
     return w
 
 @app.route("/founder")
 @founder_required
 def founder(uid):
+    sig = getattr(request, "_auth_sig", request.args.get("sig") or "")
     con = db(); cur = con.cursor()
     cur.execute("SELECT COUNT(*) c FROM users"); uc = cur.fetchone()["c"]
     cur.execute("SELECT COUNT(*) c FROM groups"); gc = cur.fetchone()["c"]
@@ -514,25 +603,27 @@ def founder(uid):
     con.close()
     uhtml = "".join(
         f'<div class="grp"><span>{"🚫" if r["is_banned"] else "✅"} @{r["username"] or "-"} ({r["first_name"] or r["user_id"]})</span>'
-        f'<a class="btn gray" href="/founder/ban?uid={uid}&target={r["user_id"]}">Ban/Alish</a></div>' for r in users)
+        f'<a class="btn gray" href="/founder/ban?uid={uid}&sig={sig}&target={r["user_id"]}">Ban/Alish</a></div>' for r in users)
     ghtml = "".join(f'<div class="grp"><span>{(r["title"] or "")[:40]}</span><small>{r["chat_id"]}</small></div>' for r in groups)
     body = f"""
 <div class="card"><h2>📊 Statistika</h2><p>👥 Userlar: <b>{uc}</b> • 📋 Guruhlar: <b>{gc}</b> • 🟢 Faol: <b>{ac}</b></p>
-<p><a class="btn red" href="/founder/stopall?uid={uid}">⛔ Hammasini to'xtatish</a></p></div>
+<p><a class="btn red" href="/founder/stopall?uid={uid}&sig={sig}">⛔ Hammasini to'xtatish</a></p></div>
 <div class="card"><h2>📢 Announce (hamma userga)</h2>
-<form action="/founder/announce?uid={uid}" method="post"><textarea name="text" rows="3" placeholder="Xabar..."></textarea>
-<button class="btn" type="submit">Yuborish</button></form></div>
+<form action="/founder/announce?uid={uid}&sig={sig}" method="post"><textarea name="text" rows="3" placeholder="Xabar..."></textarea>
+<button class="btn" type="submit">Yuborish</button></form>
+<p><small>Announce fonda yuboriladi — ko‘p user bo‘lsa ham sahifa qotmaydi.</small></p></div>
 <div class="card"><h2>👥 So'nggi 20 user</h2>{uhtml or 'yo‘q'}</div>
 <div class="card"><h2>📋 Barcha guruhlar</h2>{ghtml or 'yo‘q'}</div>"""
-    return shell("Founder", body, uid)
+    return shell("Founder", body, uid, sig)
 
 @app.route("/founder/ban")
 @founder_required
 def fban(uid):
+    sig = getattr(request, "_auth_sig", request.args.get("sig") or "")
     try:
         t = int(request.args.get("target"))
     except Exception:
-        return redirect(f"/founder?uid={uid}")
+        return redirect(f"/founder?uid={uid}&sig={sig}")
     con = db(); cur = con.cursor()
     _ex(cur, "SELECT * FROM users WHERE user_id=?", (t,))
     r = cur.fetchone()
@@ -542,28 +633,37 @@ def fban(uid):
             _ex(cur, "UPDATE broadcasts SET is_active=0 WHERE user_id=?", (t,))
         con.commit()
     con.close()
-    return redirect(f"/founder?uid={uid}")
+    return redirect(f"/founder?uid={uid}&sig={sig}")
 
 @app.route("/founder/stopall")
 @founder_required
 def fstopall(uid):
+    sig = getattr(request, "_auth_sig", request.args.get("sig") or "")
     con = db(); cur = con.cursor()
     cur.execute("UPDATE broadcasts SET is_active=0"); con.commit(); con.close()
-    return redirect(f"/founder?uid={uid}")
+    return redirect(f"/founder?uid={uid}&sig={sig}")
+
+def _announce_bg(user_ids, text):
+    for u in user_ids:
+        try:
+            tg_call("sendMessage", {"chat_id": u, "text": f"📢 Founder xabari:\n\n{text}"})
+        except Exception:
+            pass
+        time.sleep(0.05)
 
 @app.route("/founder/announce", methods=["POST"])
 @founder_required
 def fannounce(uid):
+    sig = getattr(request, "_auth_sig", request.args.get("sig") or "")
     text = (request.form.get("text") or "").strip()
     if not text:
-        return redirect(f"/founder?uid={uid}")
+        return redirect(f"/founder?uid={uid}&sig={sig}")
     con = db(); cur = con.cursor()
     cur.execute("SELECT user_id FROM users WHERE is_banned=0")
     users = [r["user_id"] for r in cur.fetchall()]; con.close()
-    for u in users:
-        tg_call("sendMessage", {"chat_id": u, "text": f"📢 Founder xabari:\n\n{text}"})
-        time.sleep(0.05)
-    return redirect(f"/founder?uid={uid}")
+    # Bloklamaslik uchun fonda yuboramiz (ko'p userda HTTP timeout bo'lmasligi uchun)
+    threading.Thread(target=_announce_bg, args=(users, text[:4000]), daemon=True).start()
+    return redirect(f"/founder?uid={uid}&sig={sig}")
 
 @app.route("/uploads/<path:f>")
 def uploads(f):
